@@ -14,8 +14,6 @@ final class WebOSSocket: NSObject, URLSessionWebSocketDelegate, URLSessionDelega
         self.allowInsecureLocalTLS = allowInsecureLocalTLS
         super.init()
         let configuration = URLSessionConfiguration.default
-        configuration.timeoutIntervalForRequest = 8
-        configuration.timeoutIntervalForResource = 8
         session = URLSession(configuration: configuration, delegate: self, delegateQueue: .main)
     }
 
