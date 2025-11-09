@@ -533,7 +533,7 @@ struct ContentView: View {
         connectStatus = .connecting(trimmedIP)
         footnote = "Connecting to \(trimmedIP)…"
 
-        tv.connect(ip: trimmedIP) { ok, message in
+        tv.connect(ip: trimmedIP, retry: .untilSuccess()) { ok, message in
             DispatchQueue.main.async {
                 if ok {
                     connectStatus = .connected
@@ -554,11 +554,16 @@ struct ContentView: View {
                         remoteActive = true
                     }
                 } else {
-                    connectStatus = .failed(message)
-                    footnote = "Failed: \(message)"
-                    if let remoteIP = pendingRemoteIP, remoteIP == trimmedIP {
-                        pendingRemoteIP = nil
-                        pendingRemoteName = ""
+                    if tv.isAutoRetryEnabled {
+                        connectStatus = .connecting(trimmedIP)
+                        footnote = message
+                    } else {
+                        connectStatus = .failed(message)
+                        footnote = "Failed: \(message)"
+                        if let remoteIP = pendingRemoteIP, remoteIP == trimmedIP {
+                            pendingRemoteIP = nil
+                            pendingRemoteName = ""
+                        }
                     }
                 }
             }

@@ -183,15 +183,20 @@ struct HomeView: View {
     // MARK: - Actions
     private func connect(after: ((Bool) -> Void)? = nil) {
         status = "Connecting…"
-        tv.connect(ip: ip) { ok, msg in
+        tv.connect(ip: ip, retry: .untilSuccess()) { ok, msg in
             if ok {
                 status = "Connected"
                 UserDefaults.standard.set(ip, forKey: "LGRemoteMVP.lastIP")
                 UserDefaults.standard.set(mac, forKey: "LGRemoteMVP.lastMAC")
+                after?(true)
             } else {
-                status = "Failed: \(msg)"
+                if tv.isAutoRetryEnabled {
+                    status = msg
+                } else {
+                    status = "Failed: \(msg)"
+                    after?(false)
+                }
             }
-            after?(ok)
         }
     }
 }
