@@ -369,6 +369,11 @@ final class WebOSTV: ObservableObject {
         let payload = (dict["payload"] as? [String: Any]) ?? [:]
         let id = dict["id"] as? String
 
+        if type == "ping" {
+            respondToPing(id: id)
+            return
+        }
+
         if type == "registered" {
             if let key = payload["client-key"] as? String {
                 Self.savedClientKey = key
@@ -456,6 +461,18 @@ final class WebOSTV: ObservableObject {
             return
         }
         failEarly("TV error: \(message)")
+    }
+
+    private func respondToPing(id: String?) {
+        var message: [String: Any] = ["type": "pong"]
+        if let id, !id.isEmpty {
+            message["id"] = id
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: message, options: []),
+              let text = String(data: data, encoding: .utf8) else {
+            return
+        }
+        socket?.send(text, completion: nil)
     }
 
     private func isClientKeyAuthError(payload: [String: Any], message: String) -> Bool {
