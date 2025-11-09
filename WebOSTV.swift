@@ -23,6 +23,8 @@ final class WebOSTV: ObservableObject {
     private var registered = false
     private var connectCompletion: ((Bool, String) -> Void)?
     private var pendingResponses: [String: (Result<[String: Any], Error>) -> Void] = [:]
+    private var registerRequestId: String?
+    private var retriedWithoutClientKey = false
     private var inputRemotePrimed = false
     private var inputRemotePriming = false
     private var inputRemoteWaiters: [(Bool) -> Void] = []
@@ -39,46 +41,49 @@ final class WebOSTV: ObservableObject {
     // MARK: Connect / Disconnect
 
     func connect(ip: String, completion: @escaping (Bool, String) -> Void) {
-          self.ip = ip
-          registered = false
-          isConnected = false
-          connectCompletion = completion
-          cancelPendingRequests(with: NSError(domain: "WebOSTV", code: -10,
-                                              userInfo: [NSLocalizedDescriptionKey: "New connection started"]))
+        self.ip = ip
+        registered = false
+        isConnected = false
+        connectCompletion = completion
+        registerRequestId = nil
+        retriedWithoutClientKey = false
+        cancelPendingRequests(with: NSError(domain: "WebOSTV", code: -10,
+                                            userInfo: [NSLocalizedDescriptionKey: "New connection started"]))
 
         resetInputRemoteState(andNotify: true)
         socket = WebOSSocket(allowInsecureLocalTLS: true)
 
         socket?.connect(host: ip,
                         onMessage: { [weak self] result in
-            self?.handleSocketMessage(result)
-        }, completion: { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .success:
-                // Socket is open; now we must REGISTER before we can send commands.
-                self.performRegisterHandshake()
-            case .failure(let err):
-                DispatchQueue.main.async {
-                    self.isConnected = false
-                    self.onDisconnect?()
-                      self.completeConnect(success: false, message: err.localizedDescription)
-                }
-            }
-        })
+                            self?.handleSocketMessage(result)
+                        }, completion: { [weak self] result in
+                            guard let self else { return }
+                            switch result {
+                            case .success:
+                                // Socket is open; now we must REGISTER before we can send commands.
+                                self.performRegisterHandshake()
+                            case .failure(let err):
+                                DispatchQueue.main.async {
+                                    self.isConnected = false
+                                    self.onDisconnect?()
+                                    self.completeConnect(success: false, message: err.localizedDescription)
+                                }
+                            }
+                        })
     }
 
     func disconnect() {
         socket?.close()
         socket = nil
         registered = false
+        registerRequestId = nil
         resetInputRemoteState(andNotify: true)
-          cancelPendingRequests(with: NSError(domain: "WebOSTV", code: -11,
-                                              userInfo: [NSLocalizedDescriptionKey: "Connection closed"]))
+        cancelPendingRequests(with: NSError(domain: "WebOSTV", code: -11,
+                                            userInfo: [NSLocalizedDescriptionKey: "Connection closed"]))
         DispatchQueue.main.async {
             self.isConnected = false
             self.onDisconnect?()
-              self.completeConnect(success: false, message: "Disconnected")
+            self.completeConnect(success: false, message: "Disconnected")
         }
     }
 
@@ -95,8 +100,11 @@ final class WebOSTV: ObservableObject {
             payload["client-key"] = key
         }
 
+        let registerId = "register-\(UUID().uuidString.prefix(6))"
+        registerRequestId = registerId
+
         let req: [String: Any] = [
-            "id": "register-\(UUID().uuidString.prefix(6))",
+            "id": registerId,
             "type": "register",
             "payload": payload
         ]
@@ -177,71 +185,147 @@ final class WebOSTV: ObservableObject {
               let dict = json as? [String: Any] else { return }
 
         let type = dict["type"] as? String ?? ""
-        if type == "registered" || (dict["payload"] as? [String: Any])?["pairingType"] as? String == "PROMPT" {
-            // Successful registration
-            if let payload = dict["payload"] as? [String: Any],
-               let key = payload["client-key"] as? String {
+        let payload = (dict["payload"] as? [String: Any]) ?? [:]
+        let id = dict["id"] as? String
+
+        if type == "registered" {
+            if let key = payload["client-key"] as? String {
                 Self.savedClientKey = key
             }
-                DispatchQueue.main.async {
-                    self.registered = true
-                    self.isConnected = true
-                    self.onConnect?()
-                    self.completeConnect(success: true, message: "Connected")
-                    self.primeInputRemoteIfNeeded()
-                }
-          } else if type == "error" {
-              let msg = (dict["error"] as? String) ?? "Unknown register error"
-              failEarly("TV error: \(msg)")
-              if let id = dict["id"] as? String {
-                  resolvePending(for: id, with: .failure(NSError(domain: "WebOSTV", code: -5,
-                                                                 userInfo: [NSLocalizedDescriptionKey: msg])))
-              }
-          } else if type == "response", let id = dict["id"] as? String {
-              let payload = (dict["payload"] as? [String: Any]) ?? [:]
-              if let returnValue = payload["returnValue"] as? Bool, returnValue == false {
-                  let message = payload["errorText"] as? String
-                      ?? payload["errorMessage"] as? String
-                      ?? payload["error"] as? String
-                      ?? "TV returned failure"
-                  resolvePending(for: id, with: .failure(NSError(domain: "WebOSTV", code: -6,
-                                                                  userInfo: [NSLocalizedDescriptionKey: message])))
-              } else {
-                  resolvePending(for: id, with: .success(payload))
-              }
+            DispatchQueue.main.async {
+                self.registerRequestId = nil
+                self.retriedWithoutClientKey = false
+                self.registered = true
+                self.isConnected = true
+                self.onConnect?()
+                self.completeConnect(success: true, message: "Connected")
+                self.primeInputRemoteIfNeeded()
+            }
+            return
         }
+
+        if type == "response", let id, id == registerRequestId {
+            if let returnValue = payload["returnValue"] as? Bool, returnValue == false {
+                let message = (payload["errorText"] as? String)
+                    ?? (payload["errorMessage"] as? String)
+                    ?? (payload["error"] as? String)
+                    ?? "TV returned failure"
+                handleRegisterFailure(payload: payload, message: message)
+            } else if let pairingType = (payload["pairingType"] as? String)?.uppercased(), pairingType == "PROMPT" {
+                DispatchQueue.main.async {
+                    self.lastMessage = "Approve the pairing request on your TV to finish connecting."
+                }
+            }
+            return
+        }
+
+        if type == "error" {
+            let message = (dict["error"] as? String)
+                ?? (payload["errorText"] as? String)
+                ?? (payload["errorMessage"] as? String)
+                ?? (payload["error"] as? String)
+                ?? "Unknown register error"
+
+            if let id, id == registerRequestId {
+                handleRegisterFailure(payload: payload, message: message)
+                return
+            }
+
+            failEarly("TV error: \(message)")
+            if let id {
+                let error = NSError(domain: "WebOSTV", code: -5,
+                                    userInfo: [NSLocalizedDescriptionKey: message])
+                resolvePending(for: id, with: .failure(error))
+            }
+            return
+        }
+
+        if type == "response", let id = id {
+            if let returnValue = payload["returnValue"] as? Bool, returnValue == false {
+                let message = (payload["errorText"] as? String)
+                    ?? (payload["errorMessage"] as? String)
+                    ?? (payload["error"] as? String)
+                    ?? "TV returned failure"
+                resolvePending(for: id, with: .failure(NSError(domain: "WebOSTV", code: -6,
+                                                                userInfo: [NSLocalizedDescriptionKey: message])))
+            } else {
+                resolvePending(for: id, with: .success(payload))
+            }
+        }
+    }
+
+    private func handleRegisterFailure(payload: [String: Any], message: String) {
+        if !retriedWithoutClientKey,
+           Self.savedClientKey != nil,
+           isClientKeyAuthError(payload: payload, message: message) {
+            Self.savedClientKey = nil
+            retriedWithoutClientKey = true
+            performRegisterHandshake()
+            return
+        }
+        failEarly("TV error: \(message)")
+    }
+
+    private func isClientKeyAuthError(payload: [String: Any], message: String) -> Bool {
+        let codes = [
+            payload["errorCode"] as? Int,
+            payload["code"] as? Int,
+            (payload["payload"] as? [String: Any])?["errorCode"] as? Int
+        ].compactMap { $0 }
+
+        if codes.contains(where: { $0 == 401 || $0 == 403 }) {
+            return true
+        }
+
+        let strings = [
+            message,
+            payload["errorText"] as? String ?? "",
+            payload["errorMessage"] as? String ?? "",
+            payload["error"] as? String ?? "",
+            payload["message"] as? String ?? ""
+        ]
+
+        let keywords = ["client key", "client-key", "unauthorized", "forbidden", "denied", "not registered", "not paired", "401", "403"]
+        for text in strings {
+            let lower = text.lowercased()
+            if keywords.contains(where: { lower.contains($0) }) {
+                return true
+            }
+        }
+        return false
     }
 
     private func failEarly(_ reason: String) {
         DispatchQueue.main.async {
             self.isConnected = false
             self.registered = false
+            self.registerRequestId = nil
             self.resetInputRemoteState(andNotify: true)
             self.onDisconnect?()
             self.lastMessage = reason
-              self.cancelPendingRequests(with: NSError(domain: "WebOSTV", code: -12,
-                                                       userInfo: [NSLocalizedDescriptionKey: reason]))
-              self.completeConnect(success: false, message: reason)
+            self.cancelPendingRequests(with: NSError(domain: "WebOSTV", code: -12,
+                                                     userInfo: [NSLocalizedDescriptionKey: reason]))
+            self.completeConnect(success: false, message: reason)
         }
     }
 
-      private func completeConnect(success: Bool, message: String) {
-          guard let completion = connectCompletion else { return }
-          connectCompletion = nil
-          completion(success, message)
-      }
+    private func completeConnect(success: Bool, message: String) {
+        guard let completion = connectCompletion else { return }
+        connectCompletion = nil
+        completion(success, message)
+    }
 
-      private func resolvePending(for id: String, with result: Result<[String: Any], Error>) {
-          guard let handler = pendingResponses.removeValue(forKey: id) else { return }
-          handler(result)
-      }
+    private func resolvePending(for id: String, with result: Result<[String: Any], Error>) {
+        guard let handler = pendingResponses.removeValue(forKey: id) else { return }
+        handler(result)
+    }
 
-      private func cancelPendingRequests(with error: Error) {
-          guard !pendingResponses.isEmpty else { return }
-          let handlers = pendingResponses
-          pendingResponses.removeAll()
-          handlers.values.forEach { $0(.failure(error)) }
-      }
+    private func cancelPendingRequests(with error: Error) {
+        guard !pendingResponses.isEmpty else { return }
+        let handlers = pendingResponses
+        pendingResponses.removeAll()
+        handlers.values.forEach { $0(.failure(error)) }
+    }
 
     // MARK: Sending helpers
 
@@ -250,7 +334,7 @@ final class WebOSTV: ObservableObject {
         return "\(prefix)-\(nextId)"
     }
 
-      private func send(_ object: [String: Any], completion: ((Error?) -> Void)? = nil) {
+    private func send(_ object: [String: Any], completion: ((Error?) -> Void)? = nil) {
         guard registered, let sock = socket else {
             completion?(NSError(domain: "WebOSTV", code: -1,
                                 userInfo: [NSLocalizedDescriptionKey: "Not registered/connected"]))
@@ -272,30 +356,30 @@ final class WebOSTV: ObservableObject {
                                 userInfo: [NSLocalizedDescriptionKey: "TV not registered yet"]))
             return
         }
-          let requestId = nextRequestId("req")
-          let req: [String: Any] = [
-              "id": requestId,
+        let requestId = nextRequestId("req")
+        let req: [String: Any] = [
+            "id": requestId,
             "type": "request",
             "uri": uri,
             "payload": payload
         ]
-          if let handler = completion {
-              pendingResponses[requestId] = { result in
-                  switch result {
-                  case .success:
-                      handler(nil)
-                  case .failure(let error):
-                      handler(error)
-                  }
-              }
-              send(req) { error in
-                  if let error {
-                      self.resolvePending(for: requestId, with: .failure(error))
-                  }
-              }
-          } else {
-              send(req)
-          }
+        if let handler = completion {
+            pendingResponses[requestId] = { result in
+                switch result {
+                case .success:
+                    handler(nil)
+                case .failure(let error):
+                    handler(error)
+                }
+            }
+            send(req) { error in
+                if let error {
+                    self.resolvePending(for: requestId, with: .failure(error))
+                }
+            }
+        } else {
+            send(req)
+        }
     }
 
     /// Remote key
