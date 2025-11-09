@@ -333,6 +333,6 @@ final class WebOSSocket: NSObject, URLSessionWebSocketDelegate, URLSessionDelega
             NSUnderlyingErrorKey: error
         ]
 
-        return NSError(domain: urlError.domain, code: urlError.errorCode, userInfo: userInfo)
+        return NSError(domain: URLError.errorDomain, code: urlError.errorCode, userInfo: userInfo)
     }
 }
