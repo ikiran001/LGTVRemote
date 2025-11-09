@@ -182,18 +182,25 @@ struct HomeView: View {
 
     // MARK: - Actions
     private func connect(after: ((Bool) -> Void)? = nil) {
+        let trimmedIP = ip.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedIP.isEmpty else {
+            status = "Missing IP address"
+            after?(false)
+            return
+        }
+
         status = "Connecting…"
-        tv.connect(ip: ip, retry: .untilSuccess()) { ok, msg in
-            if ok {
-                status = "Connected"
-                UserDefaults.standard.set(ip, forKey: "LGRemoteMVP.lastIP")
-                UserDefaults.standard.set(mac, forKey: "LGRemoteMVP.lastMAC")
-                after?(true)
-            } else {
-                if tv.isAutoRetryEnabled {
-                    status = msg
+        tv.connect(ip: trimmedIP) { ok, msg in
+            DispatchQueue.main.async {
+                if ok {
+                    self.status = "Connected"
+                    self.ip = trimmedIP
+                    UserDefaults.standard.set(trimmedIP, forKey: "LGRemoteMVP.lastIP")
+                    UserDefaults.standard.set(self.mac, forKey: "LGRemoteMVP.lastMAC")
+                    after?(true)
                 } else {
-                    status = "Failed: \(msg)"
+                    let failure = msg.isEmpty ? "Failed to connect" : msg
+                    self.status = failure.hasPrefix("Failed") ? failure : "Failed: \(failure)"
                     after?(false)
                 }
             }
