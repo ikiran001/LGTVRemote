@@ -30,22 +30,23 @@ final class WebOSSocket: NSObject, URLSessionWebSocketDelegate, URLSessionDelega
         connectHandler = completion
         targetHost = host
 
-        candidateQueue.removeAll()
-        if let secureURL = URL(string: "wss://\(host):3001/") {
-            enqueueCandidates(for: secureURL)
-        }
-        if let insecureURL = URL(string: "ws://\(host):3000/") {
-            enqueueCandidates(for: insecureURL)
-        }
+        connectGeneration &+= 1
+        let generation = connectGeneration
 
-        guard !candidateQueue.isEmpty else {
-            completion(.failure(NSError(domain: "WebOSSocket",
-                                        code: -100,
-                                        userInfo: [NSLocalizedDescriptionKey: "Invalid host: \(host)"])))
-            return
-        }
+        prepareCandidates(for: host, generation: generation) { [weak self] success in
+            guard let self, generation == self.connectGeneration else { return }
 
-        attemptNextCandidate()
+            guard success, !self.candidateQueue.isEmpty else {
+                let error = NSError(domain: "WebOSSocket",
+                                    code: -100,
+                                    userInfo: [NSLocalizedDescriptionKey: "Invalid host: \(host)"])
+                self.connectHandler?(.failure(error))
+                self.connectHandler = nil
+                return
+            }
+
+            self.attemptNextCandidate()
+        }
     }
 
     func send(_ text: String, completion: ((Error?) -> Void)? = nil) {
@@ -69,6 +70,7 @@ final class WebOSSocket: NSObject, URLSessionWebSocketDelegate, URLSessionDelega
         candidateQueue.removeAll()
         lastError = nil
         isOpen = false
+        lastReachability.removeAll()
     }
 
     // MARK: Internals
@@ -88,6 +90,8 @@ final class WebOSSocket: NSObject, URLSessionWebSocketDelegate, URLSessionDelega
     private var lastError: Error?
     private var targetHost: String = ""
     private let allowInsecureLocalTLS: Bool
+    private var connectGeneration = 0
+    private var lastReachability: [Int: Bool] = [:]
 
     private func attemptNextCandidate() {
         overallTimer?.invalidate(); overallTimer = nil
@@ -157,8 +161,9 @@ final class WebOSSocket: NSObject, URLSessionWebSocketDelegate, URLSessionDelega
     }
 
     private func failConnection(_ error: Error) {
+        let finalError = mapError(error)
         close()
-        connectHandler?(.failure(error))
+        connectHandler?(.failure(finalError))
         connectHandler = nil
     }
 
@@ -239,10 +244,95 @@ final class WebOSSocket: NSObject, URLSessionWebSocketDelegate, URLSessionDelega
         return false
     }
 
-    private func enqueueCandidates(for url: URL) {
-        if !preferredSubprotocols.isEmpty {
-            candidateQueue.append((url, preferredSubprotocols))
+    private func prepareCandidates(for host: String,
+                                   generation: Int,
+                                   completion: @escaping (Bool) -> Void) {
+        candidateQueue.removeAll()
+
+        var allCandidates: [SocketCandidate] = []
+        if let secureURL = URL(string: "wss://\(host):3001/") {
+            allCandidates.append((secureURL, preferredSubprotocols))
+            allCandidates.append((secureURL, []))
         }
-        candidateQueue.append((url, []))
+        if let insecureURL = URL(string: "ws://\(host):3000/") {
+            allCandidates.append((insecureURL, preferredSubprotocols))
+            allCandidates.append((insecureURL, []))
+        }
+
+        guard !allCandidates.isEmpty else {
+            completion(false)
+            return
+        }
+
+        let uniquePorts = Set(allCandidates.compactMap { $0.url.port })
+        if uniquePorts.isEmpty {
+            candidateQueue = allCandidates
+            lastReachability = [:]
+            completion(true)
+            return
+        }
+
+        var reachability: [Int: Bool] = [:]
+        let group = DispatchGroup()
+
+        for port in uniquePorts {
+            group.enter()
+            Ping.isReachable(ip: host, port: UInt16(port), timeout: 0.45) { reachable in
+                DispatchQueue.main.async {
+                    reachability[port] = reachable
+                }
+                group.leave()
+            }
+        }
+
+        group.notify(queue: .main) { [weak self] in
+            guard let self, generation == self.connectGeneration else { return }
+
+            self.lastReachability = reachability
+
+            var reachable: [SocketCandidate] = []
+            var fallback: [SocketCandidate] = []
+
+            for candidate in allCandidates {
+                let port = candidate.url.port ?? (candidate.url.scheme == "wss" ? 443 : 80)
+                if reachability[port] == true {
+                    reachable.append(candidate)
+                } else {
+                    fallback.append(candidate)
+                }
+            }
+
+            self.candidateQueue = reachable + fallback
+            completion(true)
+        }
+    }
+
+    private func mapError(_ error: Error) -> Error {
+        guard let urlError = error as? URLError, urlError.code == .timedOut else {
+            return error
+        }
+
+        var message = "No response from TV at \(targetHost)."
+
+        if let secureReachable = lastReachability[3001] {
+            message += secureReachable
+            ? " Port 3001 (secure) accepted a TCP probe but the WebSocket handshake never completed."
+            : " Port 3001 (secure) did not respond to a TCP probe."
+        }
+
+        if let insecureReachable = lastReachability[3000] {
+            message += insecureReachable
+            ? " Port 3000 (insecure) accepted a TCP probe but the WebSocket handshake never completed."
+            : " Port 3000 (insecure) did not respond to a TCP probe."
+        }
+
+        message += " Make sure the TV is powered on, awake, and on the same network. Try sending Wake TV first if it is in standby."
+
+        let userInfo: [String: Any] = [
+            NSLocalizedDescriptionKey: message,
+            NSUnderlyingErrorKey: error
+        ]
+
+        return NSError(domain: urlError.domain, code: urlError.errorCode, userInfo: userInfo)
     }
 }
