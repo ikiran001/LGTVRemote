@@ -1,7 +1,7 @@
 import Foundation
 
 /// WebOSSocket
-/// - Prefers the secure `wss://` transport (port 3001) and falls back to `ws://` (port 3000) only if needed.
+/// - Prefers the secure `wss://` transport (port 3000) and falls back to `ws://` (port 3000) only if needed.
 /// - Attempts each candidate sequentially instead of racing, which reduces connection-reset churn when TVs
 ///   immediately drop the insecure socket.
 final class WebOSSocket: NSObject, URLSessionWebSocketDelegate, URLSessionDelegate {
@@ -248,7 +248,7 @@ final class WebOSSocket: NSObject, URLSessionWebSocketDelegate, URLSessionDelega
         candidateQueue.removeAll()
 
         var allCandidates: [SocketCandidate] = []
-        if let secureURL = URL(string: "wss://\(host):3001/") {
+        if let secureURL = URL(string: "wss://\(host):3000/") {
             allCandidates.append((secureURL, preferredSubprotocols))
             allCandidates.append((secureURL, []))
         }
@@ -312,10 +312,10 @@ final class WebOSSocket: NSObject, URLSessionWebSocketDelegate, URLSessionDelega
 
         var message = "No response from TV at \(targetHost)."
 
-        if let secureReachable = lastReachability[3001] {
+        if let secureReachable = lastReachability[3000] {
             message += secureReachable
-            ? " Port 3001 (secure) accepted a TCP probe but the WebSocket handshake never completed."
-            : " Port 3001 (secure) did not respond to a TCP probe."
+            ? " Port 3000 (secure) accepted a TCP probe but the WebSocket handshake never completed."
+            : " Port 3000 (secure) did not respond to a TCP probe."
         }
 
         if let insecureReachable = lastReachability[3000] {
