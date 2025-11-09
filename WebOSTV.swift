@@ -32,12 +32,12 @@ final class WebOSTV: ObservableObject {
 
     enum RetryStrategy: Equatable {
         case none
-        case untilSuccess(initial: TimeInterval, max: TimeInterval, multiplier: Double)
+        case untilSuccess(initial: TimeInterval, maxDelay: TimeInterval, multiplier: Double)
 
         static func untilSuccess(initial: TimeInterval = 1.2,
                                  max: TimeInterval = 20.0,
                                  multiplier: Double = 1.6) -> RetryStrategy {
-            .untilSuccess(initial: initial, max: max, multiplier: multiplier)
+            .untilSuccess(initial: initial, maxDelay: max, multiplier: multiplier)
         }
 
         var isEnabled: Bool {
