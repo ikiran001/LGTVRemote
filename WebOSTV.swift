@@ -30,6 +30,50 @@ final class WebOSTV: ObservableObject {
     private var inputRemoteWaiters: [(Bool) -> Void] = []
     private let inputRemoteName = "LG Remote Neo"
 
+    enum RetryStrategy: Equatable {
+        case none
+        case untilSuccess(initial: TimeInterval, max: TimeInterval, multiplier: Double)
+
+        static func untilSuccess(initial: TimeInterval = 1.2,
+                                 max: TimeInterval = 20.0,
+                                 multiplier: Double = 1.6) -> RetryStrategy {
+            .untilSuccess(initial: initial, max: max, multiplier: multiplier)
+        }
+
+        var isEnabled: Bool {
+            switch self {
+            case .none: return false
+            case .untilSuccess: return true
+            }
+        }
+
+        func delay(forAttempt attempt: Int) -> TimeInterval {
+            guard case let .untilSuccess(initial, maxDelay, multiplier) = self else { return 0 }
+            let retryIndex = max(0, attempt - 2)
+            let scaled = initial * pow(multiplier, Double(retryIndex))
+            return min(scaled, maxDelay)
+        }
+    }
+
+    private var retryStrategy: RetryStrategy = .none
+    private var retryWorkItem: DispatchWorkItem?
+    private var lastRetryDelay: TimeInterval = 0
+    private var attemptsMade = 0
+
+    var isAutoRetryEnabled: Bool {
+        retryStrategy.isEnabled
+    }
+
+    var pendingRetryAttempt: Int? {
+        guard retryWorkItem != nil else { return nil }
+        return attemptsMade + 1
+    }
+
+    var pendingRetryDelay: TimeInterval? {
+        guard retryWorkItem != nil else { return nil }
+        return lastRetryDelay
+    }
+
     // Persisted convenience
     static var savedIP: String?  { UserDefaults.standard.string(forKey: "LGRemoteMVP.lastIP") }
     static var savedMAC: String? { UserDefaults.standard.string(forKey: "LGRemoteMVP.lastMAC") }
@@ -40,15 +84,29 @@ final class WebOSTV: ObservableObject {
 
     // MARK: Connect / Disconnect
 
-    func connect(ip: String, completion: @escaping (Bool, String) -> Void) {
+    func connect(ip: String,
+                 retry strategy: RetryStrategy = .none,
+                 completion: @escaping (Bool, String) -> Void) {
         self.ip = ip
         connectCompletion = completion
+        retryStrategy = strategy
+        attemptsMade = 0
+        lastRetryDelay = 0
+        cancelScheduledRetry()
         retriedWithoutClientKey = false
+        let wasConnected = isConnected
         prepareForConnectionAttempt(andNotify: true)
+        if wasConnected {
+            DispatchQueue.main.async { self.onDisconnect?() }
+        }
         startSocketConnection()
     }
 
     func disconnect() {
+        cancelScheduledRetry()
+        retryStrategy = .none
+        attemptsMade = 0
+        lastRetryDelay = 0
         socket?.close()
         socket = nil
         registered = false
@@ -78,6 +136,14 @@ final class WebOSTV: ObservableObject {
     }
 
     private func startSocketConnection() {
+        retryWorkItem = nil
+        lastRetryDelay = 0
+        attemptsMade &+= 1
+        let attemptLabel = attemptsMade
+        DispatchQueue.main.async {
+            let ipLabel = self.ip.isEmpty ? "TV" : self.ip
+            self.lastMessage = "Connecting to \(ipLabel) (attempt \(attemptLabel))"
+        }
         socket?.close()
         let newSocket = WebOSSocket(allowInsecureLocalTLS: true)
         socket = newSocket
@@ -97,17 +163,72 @@ final class WebOSTV: ObservableObject {
                           })
     }
 
+    private func cancelScheduledRetry() {
+        retryWorkItem?.cancel()
+        retryWorkItem = nil
+        lastRetryDelay = 0
+    }
+
+    @discardableResult
+    private func scheduleRetry(baseMessage: String) -> String {
+        cancelScheduledRetry()
+        let nextAttempt = attemptsMade + 1
+        let rawDelay = retryStrategy.delay(forAttempt: nextAttempt)
+        let delay = max(0.35, rawDelay)
+        lastRetryDelay = delay
+        let formattedDelay = String(format: "%.1f", delay)
+        let message = baseMessage.isEmpty
+            ? "Retrying connection in \(formattedDelay)s (attempt \(nextAttempt))."
+            : "\(baseMessage) — retrying in \(formattedDelay)s (attempt \(nextAttempt))."
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.startSocketConnection()
+        }
+        retryWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+        return message
+    }
+
+    private func shouldAutoRetry(after error: Error?) -> Bool {
+        guard retryStrategy.isEnabled, connectCompletion != nil else { return false }
+        if let error = error as NSError? {
+            if error.domain == "WebOSSocket", error.code == -100 {
+                return false
+            }
+            if error.domain == URLError.errorDomain,
+               error.code == URLError.unsupportedURL.rawValue {
+                return false
+            }
+        }
+        return true
+    }
+
     private func handleSocketConnectFailure(_ error: Error) {
         if shouldRetryWithoutClientKey(after: error) {
             retryConnectionWithoutClientKey(after: error)
             return
         }
 
+        let baseMessage = "Connection failed: \(error.localizedDescription)"
+        let wasConnected = isConnected
+
+        if shouldAutoRetry(after: error) {
+            prepareForConnectionAttempt(andNotify: false)
+            let retryMessage = scheduleRetry(baseMessage: baseMessage)
+            DispatchQueue.main.async {
+                if wasConnected { self.onDisconnect?() }
+                self.lastMessage = retryMessage
+                self.completeConnect(success: false, message: retryMessage)
+            }
+            return
+        }
+
+        retryStrategy = .none
+        prepareForConnectionAttempt(andNotify: true)
         DispatchQueue.main.async {
-            self.isConnected = false
-            self.onDisconnect?()
-            self.lastMessage = "Connection failed: \(error.localizedDescription)"
-            self.completeConnect(success: false, message: error.localizedDescription)
+            if wasConnected { self.onDisconnect?() }
+            self.lastMessage = baseMessage
+            self.completeConnect(success: false, message: baseMessage)
         }
     }
 
@@ -137,6 +258,7 @@ final class WebOSTV: ObservableObject {
     private func retryConnectionWithoutClientKey(after error: Error) {
         Self.savedClientKey = nil
         retriedWithoutClientKey = true
+        cancelScheduledRetry()
         prepareForConnectionAttempt(andNotify: false)
 
         DispatchQueue.main.async {
@@ -252,6 +374,9 @@ final class WebOSTV: ObservableObject {
                 Self.savedClientKey = key
             }
             DispatchQueue.main.async {
+                self.cancelScheduledRetry()
+                self.retryStrategy = .none
+                self.attemptsMade = 0
                 self.registerRequestId = nil
                 self.retriedWithoutClientKey = false
                 self.registered = true
@@ -419,22 +544,36 @@ final class WebOSTV: ObservableObject {
     }
 
     private func failEarly(_ reason: String) {
+        let error = NSError(domain: "WebOSTV", code: -12,
+                            userInfo: [NSLocalizedDescriptionKey: reason])
+        let wasConnected = isConnected
+        cancelPendingRequests(with: error)
+
+        if shouldAutoRetry(after: nil) {
+            prepareForConnectionAttempt(andNotify: true)
+            let retryMessage = scheduleRetry(baseMessage: reason)
+            DispatchQueue.main.async {
+                if wasConnected { self.onDisconnect?() }
+                self.lastMessage = retryMessage
+                self.completeConnect(success: false, message: retryMessage)
+            }
+            return
+        }
+
+        retryStrategy = .none
+        prepareForConnectionAttempt(andNotify: true)
         DispatchQueue.main.async {
-            self.isConnected = false
-            self.registered = false
-            self.registerRequestId = nil
-            self.resetInputRemoteState(andNotify: true)
-            self.onDisconnect?()
+            if wasConnected { self.onDisconnect?() }
             self.lastMessage = reason
-            self.cancelPendingRequests(with: NSError(domain: "WebOSTV", code: -12,
-                                                     userInfo: [NSLocalizedDescriptionKey: reason]))
             self.completeConnect(success: false, message: reason)
         }
     }
 
     private func completeConnect(success: Bool, message: String) {
         guard let completion = connectCompletion else { return }
-        connectCompletion = nil
+        if success || !isAutoRetryEnabled {
+            connectCompletion = nil
+        }
         completion(success, message)
     }
 
