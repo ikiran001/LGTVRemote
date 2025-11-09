@@ -23,6 +23,10 @@ final class WebOSTV: ObservableObject {
     private var registered = false
     private var connectCompletion: ((Bool, String) -> Void)?
     private var pendingResponses: [String: (Result<[String: Any], Error>) -> Void] = [:]
+    private var inputRemotePrimed = false
+    private var inputRemotePriming = false
+    private var inputRemoteWaiters: [(Bool) -> Void] = []
+    private let inputRemoteName = "LG Remote Neo"
 
     // Persisted convenience
     static var savedIP: String?  { UserDefaults.standard.string(forKey: "LGRemoteMVP.lastIP") }
@@ -42,7 +46,8 @@ final class WebOSTV: ObservableObject {
           cancelPendingRequests(with: NSError(domain: "WebOSTV", code: -10,
                                               userInfo: [NSLocalizedDescriptionKey: "New connection started"]))
 
-          socket = WebOSSocket(allowInsecureLocalTLS: true)
+        resetInputRemoteState(andNotify: true)
+        socket = WebOSSocket(allowInsecureLocalTLS: true)
 
         socket?.connect(host: ip,
                         onMessage: { [weak self] result in
@@ -67,6 +72,7 @@ final class WebOSTV: ObservableObject {
         socket?.close()
         socket = nil
         registered = false
+        resetInputRemoteState(andNotify: true)
           cancelPendingRequests(with: NSError(domain: "WebOSTV", code: -11,
                                               userInfo: [NSLocalizedDescriptionKey: "Connection closed"]))
         DispatchQueue.main.async {
@@ -158,6 +164,7 @@ final class WebOSTV: ObservableObject {
             DispatchQueue.main.async {
                 self.isConnected = false
                 self.registered = false
+                self.resetInputRemoteState(andNotify: true)
                 self.onDisconnect?()
                 self.lastMessage = "Socket error: \(err.localizedDescription)"
             }
@@ -176,12 +183,13 @@ final class WebOSTV: ObservableObject {
                let key = payload["client-key"] as? String {
                 Self.savedClientKey = key
             }
-              DispatchQueue.main.async {
-                  self.registered = true
-                  self.isConnected = true
-                  self.onConnect?()
-                  self.completeConnect(success: true, message: "Connected")
-              }
+                DispatchQueue.main.async {
+                    self.registered = true
+                    self.isConnected = true
+                    self.onConnect?()
+                    self.completeConnect(success: true, message: "Connected")
+                    self.primeInputRemoteIfNeeded()
+                }
           } else if type == "error" {
               let msg = (dict["error"] as? String) ?? "Unknown register error"
               failEarly("TV error: \(msg)")
@@ -208,6 +216,7 @@ final class WebOSTV: ObservableObject {
         DispatchQueue.main.async {
             self.isConnected = false
             self.registered = false
+            self.resetInputRemoteState(andNotify: true)
             self.onDisconnect?()
             self.lastMessage = reason
               self.cancelPendingRequests(with: NSError(domain: "WebOSTV", code: -12,
@@ -291,8 +300,28 @@ final class WebOSTV: ObservableObject {
 
     /// Remote key
     func sendButton(key: String) {
-        sendSimple(uri: "ssap://com.webos.service.tv.inputremote/sendButton",
-                   payload: ["name": key])
+        guard registered else {
+            DispatchQueue.main.async {
+                self.lastMessage = "Cannot send \(key) – TV not connected."
+            }
+            return
+        }
+
+        if inputRemotePrimed {
+            sendButtonCommand(key)
+            return
+        }
+
+        primeInputRemoteIfNeeded { [weak self] ready in
+            guard let self else { return }
+            if ready {
+                self.sendButtonCommand(key)
+            } else {
+                DispatchQueue.main.async {
+                    self.lastMessage = "Command \(key) aborted – remote channel unavailable."
+                }
+            }
+        }
     }
 
     /// Launch app by ID
@@ -341,4 +370,80 @@ final class WebOSTV: ObservableObject {
           return nil
       }
 }
+
+// MARK: - Input remote helpers
+
+private extension WebOSTV {
+
+    func primeInputRemoteIfNeeded(completion: ((Bool) -> Void)? = nil) {
+        guard registered else {
+            completion?(false)
+            return
+        }
+
+        if inputRemotePrimed {
+            completion?(true)
+            return
+        }
+
+        if let completion {
+            inputRemoteWaiters.append(completion)
+        }
+
+        if inputRemotePriming {
+            return
+        }
+
+        inputRemotePriming = true
+        sendSimple(uri: "ssap://com.webos.service.tv.inputremote/register",
+                   payload: ["name": inputRemoteName]) { [weak self] error in
+            guard let self else { return }
+            let success = (error == nil)
+            self.inputRemotePriming = false
+            self.inputRemotePrimed = success
+
+            let waiters = self.inputRemoteWaiters
+            self.inputRemoteWaiters.removeAll()
+            if !waiters.isEmpty {
+                waiters.forEach { $0(success) }
+            }
+
+            if let error {
+                DispatchQueue.main.async {
+                    self.lastMessage = "Remote setup failed: \(error.localizedDescription)"
+                }
+            } else if !waiters.isEmpty {
+                DispatchQueue.main.async {
+                    self.lastMessage = "Remote ready."
+                }
+            }
+        }
+    }
+
+    func resetInputRemoteState(andNotify notify: Bool) {
+        let waiters = inputRemoteWaiters
+        inputRemotePrimed = false
+        inputRemotePriming = false
+        inputRemoteWaiters.removeAll()
+
+        if notify, !waiters.isEmpty {
+            waiters.forEach { $0(false) }
+        }
+    }
+
+    func sendButtonCommand(_ name: String) {
+        sendSimple(uri: "ssap://com.webos.service.tv.inputremote/sendButton",
+                   payload: ["name": name]) { [weak self] error in
+            guard let self else { return }
+            if let error {
+                self.inputRemotePrimed = false
+                DispatchQueue.main.async {
+                    self.lastMessage = "Command \(name) failed: \(error.localizedDescription)"
+                }
+                self.primeInputRemoteIfNeeded()
+            }
+        }
+    }
+}
+
 
