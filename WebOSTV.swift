@@ -255,11 +255,19 @@ final class WebOSTV: ObservableObject {
     }
 
     private func handleRegisterFailure(payload: [String: Any], message: String) {
-        if !retriedWithoutClientKey,
-           Self.savedClientKey != nil,
-           isClientKeyAuthError(payload: payload, message: message) {
+        if let _ = Self.savedClientKey, !retriedWithoutClientKey {
+            let authRelated = isClientKeyAuthError(payload: payload, message: message)
+
             Self.savedClientKey = nil
             retriedWithoutClientKey = true
+            registerRequestId = nil
+
+            DispatchQueue.main.async {
+                self.lastMessage = authRelated
+                    ? "TV rejected the saved access key. Approve the new pairing prompt on your TV."
+                    : "Pairing failed with the saved key. Trying again—approve the pairing request on your TV."
+            }
+
             performRegisterHandshake()
             return
         }
@@ -267,17 +275,29 @@ final class WebOSTV: ObservableObject {
     }
 
     private func isClientKeyAuthError(payload: [String: Any], message: String) -> Bool {
-        let codes = [
-            payload["errorCode"] as? Int,
-            payload["code"] as? Int,
-            (payload["payload"] as? [String: Any])?["errorCode"] as? Int
-        ].compactMap { $0 }
+        var codes: [Int] = []
+        let nestedPayload = payload["payload"] as? [String: Any]
 
-        if codes.contains(where: { $0 == 401 || $0 == 403 }) {
+        let codeCandidates: [Any?] = [
+            payload["errorCode"],
+            payload["code"],
+            payload["status"],
+            payload["statusCode"],
+            nestedPayload?["errorCode"],
+            nestedPayload?["code"]
+        ]
+
+        for candidate in codeCandidates {
+            if let code = Self.parseErrorCode(candidate) {
+                codes.append(code)
+            }
+        }
+
+        if codes.contains(where: { [401, 403, -401, -403, -1000, -107, -105].contains($0) }) {
             return true
         }
 
-        let strings = [
+        var strings: [String] = [
             message,
             payload["errorText"] as? String ?? "",
             payload["errorMessage"] as? String ?? "",
@@ -285,7 +305,30 @@ final class WebOSTV: ObservableObject {
             payload["message"] as? String ?? ""
         ]
 
-        let keywords = ["client key", "client-key", "unauthorized", "forbidden", "denied", "not registered", "not paired", "401", "403"]
+        if let nested = nestedPayload {
+            strings.append(contentsOf: [
+                nested["errorText"] as? String ?? "",
+                nested["errorMessage"] as? String ?? "",
+                nested["error"] as? String ?? "",
+                nested["message"] as? String ?? ""
+            ])
+        }
+
+        let keywords = [
+            "client key",
+            "client-key",
+            "unauthorized",
+            "forbidden",
+            "denied",
+            "not registered",
+            "not paired",
+            "authentication",
+            "auth failure",
+            "invalid key",
+            "invalid client",
+            "pairing key"
+        ]
+
         for text in strings {
             let lower = text.lowercased()
             if keywords.contains(where: { lower.contains($0) }) {
@@ -293,6 +336,27 @@ final class WebOSTV: ObservableObject {
             }
         }
         return false
+    }
+
+    private static func parseErrorCode(_ value: Any?) -> Int? {
+        switch value {
+        case let int as Int:
+            return int
+        case let number as NSNumber:
+            return number.intValue
+        case let string as String:
+            let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let int = Int(trimmed) {
+                return int
+            }
+            if trimmed.lowercased().hasPrefix("0x"),
+               let int = Int(trimmed.dropFirst(2), radix: 16) {
+                return int
+            }
+            return nil
+        default:
+            return nil
+        }
     }
 
     private func failEarly(_ reason: String) {
