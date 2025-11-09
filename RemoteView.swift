@@ -1,11 +1,12 @@
 import SwiftUI
+import UIKit
 
 struct RemoteView: View {
     @ObservedObject var tv: WebOSTV
     var displayName: String? = nil
 
     // Haptics
-    private let impact = UIImpactFeedbackGenerator(style: .light)
+    private let impact = UIImpactFeedbackGenerator(style: .soft)
 
     var body: some View {
         NavigationStack {
@@ -32,17 +33,16 @@ struct RemoteView: View {
                     }
                     .padding(.horizontal)
 
-                    // D-Pad (aligned using Grid)
-                    DPadGrid { dir in
-                        impact.impactOccurred()
-                        switch dir {
-                        case .up: sendKey("UP")
-                        case .down: sendKey("DOWN")
-                        case .left: sendKey("LEFT")
-                        case .right: sendKey("RIGHT")
-                        case .ok: sendKey("ENTER")
-                        }
-                    }
+                      // D-Pad (aligned using Grid)
+                      DPadGrid { dir in
+                          switch dir {
+                          case .up: sendKey("UP")
+                          case .down: sendKey("DOWN")
+                          case .left: sendKey("LEFT")
+                          case .right: sendKey("RIGHT")
+                          case .ok: sendKey("ENTER")
+                          }
+                      }
                     .padding(.horizontal)
 
                     // Volume / Channel (long-press repeat)
@@ -72,16 +72,16 @@ struct RemoteView: View {
 
                     // Apps
                     VStack(alignment: .leading, spacing: 10) {
-                        Text("Apps").font(.headline).padding(.horizontal)
-                        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 14) {
-                            AppTile(title: "YouTube", system: "play.rectangle.fill") { launch("youtube.leanback.v4") }
-                            AppTile(title: "Netflix", system: "n.circle.fill") { launch("netflix") }
-                            AppTile(title: "Prime", system: "a.circle.fill") { launch("amzn.tvarm") }
-                            AppTile(title: "Hotstar", system: "star.circle.fill") { launch("com.startv.hotstar.lg") }
-                            AppTile(title: "JioCinema", system: "j.circle.fill") { launch("com.jio.media.jioplay.tv") }
-                            AppTile(title: "SonyLIV", system: "s.circle.fill") { launch("com.sonyliv.lg") }
-                        }
-                        .padding(.horizontal)
+                          Text("Apps").font(.headline).padding(.horizontal)
+                          LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 14) {
+                              AppTile(title: "YouTube", abbreviation: "YT", tint: .red) { launch("youtube.leanback.v4") }
+                              AppTile(title: "Netflix", abbreviation: "N", tint: .black) { launch("netflix") }
+                              AppTile(title: "Prime", abbreviation: "PV", tint: Color(red: 0.08, green: 0.33, blue: 0.71)) { launch("amzn.tvarm") }
+                              AppTile(title: "Hotstar", abbreviation: "HS", tint: Color(red: 0.02, green: 0.42, blue: 0.39)) { launch("com.startv.hotstar.lg") }
+                              AppTile(title: "JioCinema", abbreviation: "JC", tint: Color(red: 0.57, green: 0.0, blue: 0.33)) { launch("com.jio.media.jioplay.tv") }
+                              AppTile(title: "SonyLIV", abbreviation: "SL", tint: Color(red: 0.21, green: 0.16, blue: 0.55)) { launch("com.sonyliv.lg") }
+                          }
+                          .padding(.horizontal)
                     }
 
                     if !tv.lastMessage.isEmpty {
@@ -98,17 +98,20 @@ struct RemoteView: View {
                                startPoint: .topLeading, endPoint: .bottomTrailing)
                     .ignoresSafeArea()
             )
-            .navigationTitle(displayName ?? "Remote")
-            .navigationBarTitleDisplayMode(.inline)
+              .navigationTitle(displayName ?? "Remote")
+              .navigationBarTitleDisplayMode(.inline)
+              .onAppear { impact.prepare() }
         }
     }
 
     private func sendKey(_ name: String) {
+        fireHaptic()
         guard tv.isConnected else { return }
         tv.sendButton(key: name)
     }
 
     private func launch(_ appId: String) {
+        fireHaptic()
         guard tv.isConnected else { return }
         tv.launchStreamingApp(appId)
     }
@@ -117,6 +120,11 @@ struct RemoteView: View {
         let fallback = tv.ip.isEmpty ? "TV" : "TV @ \(tv.ip)"
         if let name = displayName, !name.isEmpty { return name }
         return fallback
+    }
+
+    private func fireHaptic() {
+        impact.impactOccurred()
+        impact.prepare()
     }
 }
 
@@ -129,8 +137,8 @@ private struct PillButton: View {
 
     var body: some View {
         Button(action: action) {
-            VStack(spacing: 6) {
-                RoundedRectangle(cornerRadius: 16).fill(.ultraThinMaterial)
+              VStack(spacing: 6) {
+                  RoundedRectangle(cornerRadius: 16).fill(Color.white.opacity(0.08))
                     .overlay(
                         RoundedRectangle(cornerRadius: 16)
                             .stroke(Color.white.opacity(0.35), lineWidth: 1)
@@ -199,24 +207,26 @@ private struct PowerButton: View {
 }
 
 private struct AppTile: View {
-    let title: String
-    let system: String
+      let title: String
+      let abbreviation: String
+      let tint: Color
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
-            VStack(spacing: 8) {
-                RoundedRectangle(cornerRadius: 18).fill(.ultraThinMaterial)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 18)
-                            .stroke(Color.white.opacity(0.35), lineWidth: 1)
-                    )
-                    .frame(height: 64)
-                    .overlay(
-                        Image(systemName: system)
-                            .font(.system(size: 26, weight: .semibold))
-                            .foregroundStyle(.white)
-                    )
+              VStack(spacing: 8) {
+                  RoundedRectangle(cornerRadius: 18)
+                      .fill(tint.opacity(0.35))
+                      .overlay(
+                          RoundedRectangle(cornerRadius: 18)
+                              .stroke(tint.opacity(0.65), lineWidth: 1.5)
+                      )
+                      .overlay(
+                          Text(abbreviation)
+                              .font(.system(size: 24, weight: .bold))
+                              .foregroundStyle(.white)
+                      )
+                      .frame(height: 64)
                 Text(title)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
@@ -233,27 +243,27 @@ private struct DPadGrid: View {
 
     var body: some View {
         VStack(spacing: 12) {
-            HStack(spacing: 12) {
-                Spacer()
-                Arrow("chevron.up") { tap(.up) }
-                Spacer()
-            }
-            HStack(spacing: 12) {
-                Arrow("chevron.left") { tap(.left) }
-                OK { tap(.ok) }
-                Arrow("chevron.right") { tap(.right) }
-            }
-            HStack(spacing: 12) {
-                Spacer()
-                Arrow("chevron.down") { tap(.down) }
-                Spacer()
-            }
+              HStack(spacing: 12) {
+                  Spacer()
+                  Arrow("chevron.up") { tap(.up) }
+                  Spacer()
+              }
+              HStack(spacing: 12) {
+                  Arrow("chevron.left") { tap(.left) }
+                  OK { tap(.ok) }
+                  Arrow("chevron.right") { tap(.right) }
+              }
+              HStack(spacing: 12) {
+                  Spacer()
+                  Arrow("chevron.down") { tap(.down) }
+                  Spacer()
+              }
         }
     }
 
     private func Arrow(_ name: String, _ action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            RoundedRectangle(cornerRadius: 16).fill(.ultraThinMaterial)
+          Button(action: action) {
+              RoundedRectangle(cornerRadius: 16).fill(Color.white.opacity(0.08))
                 .overlay(
                     RoundedRectangle(cornerRadius: 16)
                         .stroke(Color.white.opacity(0.35), lineWidth: 1)
@@ -269,9 +279,9 @@ private struct DPadGrid: View {
     }
 
     private func OK(_ action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Circle()
-                .fill(.thinMaterial)
+          Button(action: action) {
+              Circle()
+                  .fill(Color.white.opacity(0.1))
                 .overlay(Circle().stroke(Color.white.opacity(0.5), lineWidth: 1))
                 .frame(width: 90, height: 90)
                 .overlay(
