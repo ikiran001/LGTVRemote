@@ -56,10 +56,9 @@ struct ContentView: View {
                     Button {
                         showPairSheet = true
                     } label: {
-                        Label("Pair TV", systemImage: "plus")
+                        Image(systemName: "plus")
                     }
-                    .buttonStyle(.borderedProminent)
-                    .buttonBorderShape(.capsule)
+                    .accessibilityLabel("Pair TV")
                 }
             }
             .sheet(isPresented: $showPairSheet) {
