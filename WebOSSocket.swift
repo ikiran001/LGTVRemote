@@ -1,9 +1,9 @@
 import Foundation
 
 /// WebOSSocket
-/// - Prefers the secure `wss://` transport (port 3000) and falls back to `ws://` (port 3000) only if needed.
+/// - Prefers the secure `wss://` transport (port 3001) and falls back to `ws://` (port 3000) only if needed.
 /// - Attempts each candidate sequentially instead of racing, which reduces connection-reset churn when TVs
-///   immediately drop the insecure socket.
+///   immediately drop transports they do not support.
 final class WebOSSocket: NSObject, URLSessionWebSocketDelegate, URLSessionDelegate {
 
     private typealias SocketCandidate = (url: URL, protocols: [String])
@@ -248,13 +248,20 @@ final class WebOSSocket: NSObject, URLSessionWebSocketDelegate, URLSessionDelega
         candidateQueue.removeAll()
 
         var allCandidates: [SocketCandidate] = []
-        if let secureURL = URL(string: "wss://\(host):3000/") {
-            allCandidates.append((secureURL, preferredSubprotocols))
-            allCandidates.append((secureURL, []))
+        let securePorts = [3001, 3000] // 3001 is the documented TLS port; keep 3000 as a legacy fallback.
+        for port in securePorts {
+            if let secureURL = URL(string: "wss://\(host):\(port)/") {
+                allCandidates.append((secureURL, preferredSubprotocols))
+                allCandidates.append((secureURL, []))
+            }
         }
-        if let insecureURL = URL(string: "ws://\(host):3000/") {
-            allCandidates.append((insecureURL, preferredSubprotocols))
-            allCandidates.append((insecureURL, []))
+
+        let insecurePorts = [3000]
+        for port in insecurePorts {
+            if let insecureURL = URL(string: "ws://\(host):\(port)/") {
+                allCandidates.append((insecureURL, preferredSubprotocols))
+                allCandidates.append((insecureURL, []))
+            }
         }
 
         guard !allCandidates.isEmpty else {
@@ -312,16 +319,20 @@ final class WebOSSocket: NSObject, URLSessionWebSocketDelegate, URLSessionDelega
 
         var message = "No response from TV at \(targetHost)."
 
-        if let secureReachable = lastReachability[3000] {
-            message += secureReachable
-            ? " Port 3000 (secure) accepted a TCP probe but the WebSocket handshake never completed."
-            : " Port 3000 (secure) did not respond to a TCP probe."
-        }
-
-        if let insecureReachable = lastReachability[3000] {
-            message += insecureReachable
-            ? " Port 3000 (insecure) accepted a TCP probe but the WebSocket handshake never completed."
-            : " Port 3000 (insecure) did not respond to a TCP probe."
+        if !lastReachability.isEmpty {
+            let portDescriptions: [Int: String] = [
+                3001: "secure (wss)",
+                3000: "legacy (ws / fallback wss)"
+            ]
+            let sortedPorts = lastReachability.keys.sorted()
+            for port in sortedPorts {
+                let descriptor = portDescriptions[port] ?? "port \(port)"
+                if lastReachability[port] == true {
+                    message += " Port \(port) (\(descriptor)) accepted a TCP probe but the WebSocket handshake never completed."
+                } else {
+                    message += " Port \(port) (\(descriptor)) did not respond to a TCP probe."
+                }
+            }
         }
 
         message += " Make sure the TV is powered on, awake, and on the same network. Try sending Wake TV first if it is in standby."
