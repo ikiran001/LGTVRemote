@@ -6,6 +6,8 @@ import Foundation
 ///   immediately drop the insecure socket.
 final class WebOSSocket: NSObject, URLSessionWebSocketDelegate, URLSessionDelegate {
 
+    private typealias SocketCandidate = (url: URL, protocols: [String])
+
     // MARK: Public API
 
     init(allowInsecureLocalTLS: Bool = true) {
@@ -30,10 +32,10 @@ final class WebOSSocket: NSObject, URLSessionWebSocketDelegate, URLSessionDelega
 
         candidateQueue.removeAll()
         if let secureURL = URL(string: "wss://\(host):3001/") {
-            candidateQueue.append(secureURL)
+            enqueueCandidates(for: secureURL)
         }
         if let insecureURL = URL(string: "ws://\(host):3000/") {
-            candidateQueue.append(insecureURL)
+            enqueueCandidates(for: insecureURL)
         }
 
         guard !candidateQueue.isEmpty else {
@@ -75,7 +77,9 @@ final class WebOSSocket: NSObject, URLSessionWebSocketDelegate, URLSessionDelega
     private var messageHandler: ((Result<URLSessionWebSocketTask.Message, Error>) -> Void)?
     private var connectHandler: ((Result<Void, Error>) -> Void)?
 
-    private var candidateQueue: [URL] = []
+    private let preferredSubprotocols = ["lgtv"]
+
+    private var candidateQueue: [SocketCandidate] = []
     private var currentTask: URLSessionWebSocketTask?
     private var overallTimer: Timer?
     private var pingTimer: Timer?
@@ -98,8 +102,13 @@ final class WebOSSocket: NSObject, URLSessionWebSocketDelegate, URLSessionDelega
             return
         }
 
-        let nextURL = candidateQueue.removeFirst()
-        let task = session.webSocketTask(with: nextURL)
+        let nextCandidate = candidateQueue.removeFirst()
+        let task: URLSessionWebSocketTask
+        if nextCandidate.protocols.isEmpty {
+            task = session.webSocketTask(with: nextCandidate.url)
+        } else {
+            task = session.webSocketTask(with: nextCandidate.url, protocols: nextCandidate.protocols)
+        }
         currentTask = task
 
         scheduleOverallTimer()
@@ -228,5 +237,12 @@ final class WebOSSocket: NSObject, URLSessionWebSocketDelegate, URLSessionDelega
             }
         }
         return false
+    }
+
+    private func enqueueCandidates(for url: URL) {
+        if !preferredSubprotocols.isEmpty {
+            candidateQueue.append((url, preferredSubprotocols))
+        }
+        candidateQueue.append((url, []))
     }
 }
