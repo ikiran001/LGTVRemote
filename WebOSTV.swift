@@ -3,9 +3,9 @@ import Foundation
 import Combine
 
 /// High-level session for LG webOS TVs, sitting atop WebOSSocket.
-/// - Opens a WebSocket (ws/wss raced inside WebOSSocket)
-/// - Performs the **register** handshake (pairing). We mark `isConnected` only after "registered".
-/// - Persists and reuses `client-key` so you won't be prompted again.
+/// - Pre-pings the host for quick feedback
+/// - Opens WebSocket (ws/wss raced in WebOSSocket)
+/// - Performs REGISTER (pairing) and sets isConnected only after "registered"
 final class WebOSTV: ObservableObject {
 
     // MARK: Published state for UI
@@ -13,66 +13,13 @@ final class WebOSTV: ObservableObject {
     @Published private(set) var ip: String = ""
     @Published private(set) var lastMessage: String = ""
 
-    // Optional callbacks
     var onConnect: (() -> Void)?
     var onDisconnect: (() -> Void)?
 
-    // MARK: Internals
+    // Internals
     private var socket: WebOSSocket?
     private var nextId = 1
     private var registered = false
-    private var connectCompletion: ((Bool, String) -> Void)?
-    private var pendingResponses: [String: (Result<[String: Any], Error>) -> Void] = [:]
-    private var registerRequestId: String?
-    private var retriedWithoutClientKey = false
-    private var inputRemotePrimed = false
-    private var inputRemotePriming = false
-    private var inputRemoteWaiters: [(Bool) -> Void] = []
-    private let inputRemoteName = "LG Remote Neo"
-
-    enum RetryStrategy: Equatable {
-        case none
-        case untilSuccess(initial: TimeInterval, maxDelay: TimeInterval, multiplier: Double)
-
-        static func untilSuccess(initial: TimeInterval = 1.2,
-                                 max: TimeInterval = 20.0,
-                                 multiplier: Double = 1.6) -> RetryStrategy {
-            .untilSuccess(initial: initial, maxDelay: max, multiplier: multiplier)
-        }
-
-        var isEnabled: Bool {
-            switch self {
-            case .none: return false
-            case .untilSuccess: return true
-            }
-        }
-
-        func delay(forAttempt attempt: Int) -> TimeInterval {
-            guard case let .untilSuccess(initial, maxDelay, multiplier) = self else { return 0 }
-            let retryIndex = max(0, attempt - 2)
-            let scaled = initial * pow(multiplier, Double(retryIndex))
-            return min(scaled, maxDelay)
-        }
-    }
-
-    private var retryStrategy: RetryStrategy = .none
-    private var retryWorkItem: DispatchWorkItem?
-    private var lastRetryDelay: TimeInterval = 0
-    private var attemptsMade = 0
-
-    var isAutoRetryEnabled: Bool {
-        retryStrategy.isEnabled
-    }
-
-    var pendingRetryAttempt: Int? {
-        guard retryWorkItem != nil else { return nil }
-        return attemptsMade + 1
-    }
-
-    var pendingRetryDelay: TimeInterval? {
-        guard retryWorkItem != nil else { return nil }
-        return lastRetryDelay
-    }
 
     // Persisted convenience
     static var savedIP: String?  { UserDefaults.standard.string(forKey: "LGRemoteMVP.lastIP") }
@@ -82,214 +29,85 @@ final class WebOSTV: ObservableObject {
         set { UserDefaults.standard.setValue(newValue, forKey: "LGRemoteMVP.clientKey") }
     }
 
-    // MARK: Connect / Disconnect
+    // MARK: Connect
 
-    func connect(ip: String,
-                 retry strategy: RetryStrategy = .none,
-                 completion: @escaping (Bool, String) -> Void) {
+    /// Connect, but first do a fast ICMP reachability check for nicer UX.
+    func connect(ip: String, completion: @escaping (Bool, String) -> Void) {
         self.ip = ip
-        connectCompletion = completion
-        retryStrategy = strategy
-        attemptsMade = 0
-        lastRetryDelay = 0
-        cancelScheduledRetry()
-        retriedWithoutClientKey = false
-        let wasConnected = isConnected
-        prepareForConnectionAttempt(andNotify: true)
-        if wasConnected {
-            DispatchQueue.main.async { self.onDisconnect?() }
+        registered = false
+        isConnected = false
+        lastMessage = "Pinging \(ip)…"
+
+        // 1) quick reachability (uses your Ping.swift)
+        Ping.isReachable(ip: ip, port: 3000, timeout: 0.7) { [weak self] reachable in
+            guard let self else { return }
+            if !reachable {
+                // Try 3001 as well (some models only respond there)
+                Ping.isReachable(ip: ip, port: 3001, timeout: 0.7) { [weak self] reachable2 in
+                    guard let self else { return }
+                    if !reachable2 {
+                        DispatchQueue.main.async {
+                            self.lastMessage = "TV at \(ip) didn’t respond on 3000/3001. Check Wi-Fi / LG Connect Apps."
+                        }
+                        completion(false, "Host not reachable")
+                        return
+                    }
+                    self.openSocketAndRegister(completion: completion)
+                }
+            } else {
+                self.openSocketAndRegister(completion: completion)
+            }
         }
-        startSocketConnection()
+    }
+
+    private func openSocketAndRegister(completion: @escaping (Bool, String) -> Void) {
+        DispatchQueue.main.async { self.lastMessage = "Opening socket…" }
+        socket = WebOSSocket(allowInsecureLocalTLS: true)
+        socket?.connect(host: ip,
+                        onMessage: { [weak self] result in
+            self?.handleSocketMessage(result)
+        }, completion: { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success:
+                self.performRegisterHandshake()
+            case .failure(let err):
+                DispatchQueue.main.async {
+                    self.isConnected = false
+                    self.onDisconnect?()
+                    self.lastMessage = "Connect failed: \(err.localizedDescription)"
+                    completion(false, err.localizedDescription)
+                }
+            }
+        })
     }
 
     func disconnect() {
-        cancelScheduledRetry()
-        retryStrategy = .none
-        attemptsMade = 0
-        lastRetryDelay = 0
         socket?.close()
         socket = nil
         registered = false
-        registerRequestId = nil
-        resetInputRemoteState(andNotify: true)
-        cancelPendingRequests(with: NSError(domain: "WebOSTV", code: -11,
-                                            userInfo: [NSLocalizedDescriptionKey: "Connection closed"]))
         DispatchQueue.main.async {
             self.isConnected = false
             self.onDisconnect?()
-            self.completeConnect(success: false, message: "Disconnected")
         }
     }
 
     // MARK: Pairing / Register
 
-    private func prepareForConnectionAttempt(andNotify notify: Bool) {
-        socket?.close()
-        socket = nil
-        registered = false
-        isConnected = false
-        registerRequestId = nil
-
-        cancelPendingRequests(with: NSError(domain: "WebOSTV", code: -10,
-                                            userInfo: [NSLocalizedDescriptionKey: "New connection started"]))
-        resetInputRemoteState(andNotify: notify)
-    }
-
-    private func startSocketConnection() {
-        retryWorkItem = nil
-        lastRetryDelay = 0
-        attemptsMade &+= 1
-        let attemptLabel = attemptsMade
-        DispatchQueue.main.async {
-            let ipLabel = self.ip.isEmpty ? "TV" : self.ip
-            self.lastMessage = "Connecting to \(ipLabel) (attempt \(attemptLabel))"
-        }
-        socket?.close()
-        let newSocket = WebOSSocket(allowInsecureLocalTLS: true)
-        socket = newSocket
-
-        newSocket.connect(host: ip,
-                          onMessage: { [weak self] result in
-                              self?.handleSocketMessage(result)
-                          }, completion: { [weak self] result in
-                              guard let self else { return }
-                              switch result {
-                              case .success:
-                                  // Socket is open; now we must REGISTER before we can send commands.
-                                  self.performRegisterHandshake()
-                              case .failure(let err):
-                                  self.handleSocketConnectFailure(err)
-                              }
-                          })
-    }
-
-    private func cancelScheduledRetry() {
-        retryWorkItem?.cancel()
-        retryWorkItem = nil
-        lastRetryDelay = 0
-    }
-
-    @discardableResult
-    private func scheduleRetry(baseMessage: String) -> String {
-        cancelScheduledRetry()
-        let nextAttempt = attemptsMade + 1
-        let rawDelay = retryStrategy.delay(forAttempt: nextAttempt)
-        let delay = max(0.35, rawDelay)
-        lastRetryDelay = delay
-        let formattedDelay = String(format: "%.1f", delay)
-        let message = baseMessage.isEmpty
-            ? "Retrying connection in \(formattedDelay)s (attempt \(nextAttempt))."
-            : "\(baseMessage) — retrying in \(formattedDelay)s (attempt \(nextAttempt))."
-        let workItem = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.startSocketConnection()
-        }
-        retryWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
-        return message
-    }
-
-    private func shouldAutoRetry(after error: Error?) -> Bool {
-        guard retryStrategy.isEnabled, connectCompletion != nil else { return false }
-        if let error = error as NSError? {
-            if error.domain == "WebOSSocket", error.code == -100 {
-                return false
-            }
-            if error.domain == URLError.errorDomain,
-               error.code == URLError.unsupportedURL.rawValue {
-                return false
-            }
-        }
-        return true
-    }
-
-    private func handleSocketConnectFailure(_ error: Error) {
-        if shouldRetryWithoutClientKey(after: error) {
-            retryConnectionWithoutClientKey(after: error)
-            return
-        }
-
-        let baseMessage = "Connection failed: \(error.localizedDescription)"
-        let wasConnected = isConnected
-
-        if shouldAutoRetry(after: error) {
-            prepareForConnectionAttempt(andNotify: false)
-            let retryMessage = scheduleRetry(baseMessage: baseMessage)
-            DispatchQueue.main.async {
-                if wasConnected { self.onDisconnect?() }
-                self.lastMessage = retryMessage
-                self.completeConnect(success: false, message: retryMessage)
-            }
-            return
-        }
-
-        retryStrategy = .none
-        prepareForConnectionAttempt(andNotify: true)
-        DispatchQueue.main.async {
-            if wasConnected { self.onDisconnect?() }
-            self.lastMessage = baseMessage
-            self.completeConnect(success: false, message: baseMessage)
-        }
-    }
-
-    private func shouldRetryWithoutClientKey(after error: Error) -> Bool {
-        guard !registered,
-              !retriedWithoutClientKey,
-              registerRequestId != nil,
-              Self.savedClientKey != nil else {
-            return false
-        }
-
-        let nsError = error as NSError
-
-        if nsError.domain == URLError.errorDomain,
-           nsError.code == URLError.networkConnectionLost.rawValue {
-            return true
-        }
-
-        if nsError.domain == NSPOSIXErrorDomain,
-           nsError.code == Int(POSIXErrorCode.ECONNRESET.rawValue) {
-            return true
-        }
-
-        return false
-    }
-
-    private func retryConnectionWithoutClientKey(after error: Error) {
-        Self.savedClientKey = nil
-        retriedWithoutClientKey = true
-        cancelScheduledRetry()
-        prepareForConnectionAttempt(andNotify: false)
-
-        DispatchQueue.main.async {
-            self.lastMessage = "TV rejected the saved access key. Approve the new pairing request on your TV."
-        }
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-            self?.startSocketConnection()
-        }
-    }
-
     private func performRegisterHandshake() {
-        // If we have a client-key, send it to avoid the prompt.
+        DispatchQueue.main.async { self.lastMessage = "Registering…" }
         var payload: [String: Any] = [
             "forcePairing": false,
             "pairingType": "PROMPT",
-            "manifest": manifest // permissions we request
+            "manifest": manifest
         ]
-        if let key = Self.savedClientKey {
-            payload["client-key"] = key
-        }
-
-        let registerId = "register-\(UUID().uuidString.prefix(6))"
-        registerRequestId = registerId
+        if let key = Self.savedClientKey { payload["client-key"] = key }
 
         let req: [String: Any] = [
-            "id": registerId,
+            "id": "register-\(UUID().uuidString.prefix(6))",
             "type": "register",
             "payload": payload
         ]
-        // Send raw; don't guard on isConnected yet—we're not "connected" until registered.
         guard let data = try? JSONSerialization.data(withJSONObject: req, options: []),
               let text = String(data: data, encoding: .utf8) else {
             failEarly("Encode error during register.")
@@ -300,7 +118,6 @@ final class WebOSTV: ObservableObject {
         })
     }
 
-    /// Minimal manifest: request only what we need for remote + app launch.
     private var manifest: [String: Any] {
         [
             "manifestVersion": 1,
@@ -310,29 +127,12 @@ final class WebOSTV: ObservableObject {
                 "appId": "com.example.lgremote.mvp"
             ],
             "permissions": [
-                "LAUNCH",
-                "LAUNCH_WEBAPP",
-                "APP_TO_APP",
-                "CLOSE",
-                "TEST_OPEN",
-                "TEST_PROTECTED",
-                "CONTROL_AUDIO",
-                "CONTROL_DISPLAY",
-                "CONTROL_INPUT_MEDIA_PLAYBACK",
-                "CONTROL_POWER",
-                "READ_APP_STATUS",
-                "READ_CURRENT_CHANNEL",
-                "READ_INPUT_DEVICE_LIST",
-                "READ_NETWORK_STATE",
-                "READ_TV_CHANNEL_LIST",
-                "WRITE_NOTIFICATION_TOAST",
-                "CONTROL_MOUSE_AND_KEYBOARD",
-                "CONTROL_INPUT_TEXT",
-                "CONTROL_INPUT_JOYSTICK",
-                "CONTROL_VOLUME",
-                "CONTROL_CHANNEL",
-                "CONTROL_MEDIA_PLAYBACK",
-                "CONTROL_INPUT_MEDIA_RECORDING",
+                "LAUNCH","LAUNCH_WEBAPP","APP_TO_APP","CLOSE","TEST_OPEN","TEST_PROTECTED",
+                "CONTROL_AUDIO","CONTROL_DISPLAY","CONTROL_INPUT_MEDIA_PLAYBACK","CONTROL_POWER",
+                "READ_APP_STATUS","READ_CURRENT_CHANNEL","READ_INPUT_DEVICE_LIST","READ_NETWORK_STATE",
+                "READ_TV_CHANNEL_LIST","WRITE_NOTIFICATION_TOAST",
+                "CONTROL_MOUSE_AND_KEYBOARD","CONTROL_INPUT_TEXT","CONTROL_INPUT_JOYSTICK",
+                "CONTROL_VOLUME","CONTROL_CHANNEL","CONTROL_MEDIA_PLAYBACK","CONTROL_INPUT_MEDIA_RECORDING",
                 "CONTROL_INPUT_TV"
             ]
         ]
@@ -353,7 +153,6 @@ final class WebOSTV: ObservableObject {
             DispatchQueue.main.async {
                 self.isConnected = false
                 self.registered = false
-                self.resetInputRemoteState(andNotify: true)
                 self.onDisconnect?()
                 self.lastMessage = "Socket error: \(err.localizedDescription)"
             }
@@ -366,244 +165,47 @@ final class WebOSTV: ObservableObject {
               let dict = json as? [String: Any] else { return }
 
         let type = dict["type"] as? String ?? ""
-        let payload = (dict["payload"] as? [String: Any]) ?? [:]
-        let id = dict["id"] as? String
-
-        if type == "ping" {
-            respondToPing(id: id)
-            return
-        }
-
         if type == "registered" {
-            if let key = payload["client-key"] as? String {
+            if let payload = dict["payload"] as? [String: Any],
+               let key = payload["client-key"] as? String {
                 Self.savedClientKey = key
             }
             DispatchQueue.main.async {
-                self.cancelScheduledRetry()
-                self.retryStrategy = .none
-                self.attemptsMade = 0
-                self.registerRequestId = nil
-                self.retriedWithoutClientKey = false
                 self.registered = true
                 self.isConnected = true
+                self.lastMessage = "Registered ✓"
                 self.onConnect?()
-                self.completeConnect(success: true, message: "Connected")
-                self.primeInputRemoteIfNeeded()
-            }
-            return
-        }
-
-        if type == "response", let id, id == registerRequestId {
-            if let returnValue = payload["returnValue"] as? Bool, returnValue == false {
-                let message = (payload["errorText"] as? String)
-                    ?? (payload["errorMessage"] as? String)
-                    ?? (payload["error"] as? String)
-                    ?? "TV returned failure"
-                handleRegisterFailure(payload: payload, message: message)
-            } else if let pairingType = (payload["pairingType"] as? String)?.uppercased(), pairingType == "PROMPT" {
-                DispatchQueue.main.async {
-                    self.lastMessage = "Approve the pairing request on your TV to finish connecting."
-                }
             }
             return
         }
 
         if type == "error" {
-            let message = (dict["error"] as? String)
-                ?? (payload["errorText"] as? String)
-                ?? (payload["errorMessage"] as? String)
-                ?? (payload["error"] as? String)
-                ?? "Unknown register error"
-
-            if let id, id == registerRequestId {
-                handleRegisterFailure(payload: payload, message: message)
-                return
-            }
-
-            failEarly("TV error: \(message)")
-            if let id {
-                let error = NSError(domain: "WebOSTV", code: -5,
-                                    userInfo: [NSLocalizedDescriptionKey: message])
-                resolvePending(for: id, with: .failure(error))
-            }
-            return
+            let msg = (dict["error"] as? String) ?? "Unknown register error"
+            failEarly("TV error: \(msg)")
         }
 
-        if type == "response", let id = id {
-            if let returnValue = payload["returnValue"] as? Bool, returnValue == false {
-                let message = (payload["errorText"] as? String)
-                    ?? (payload["errorMessage"] as? String)
-                    ?? (payload["error"] as? String)
-                    ?? "TV returned failure"
-                resolvePending(for: id, with: .failure(NSError(domain: "WebOSTV", code: -6,
-                                                                userInfo: [NSLocalizedDescriptionKey: message])))
-            } else {
-                resolvePending(for: id, with: .success(payload))
-            }
-        }
-    }
-
-    private func handleRegisterFailure(payload: [String: Any], message: String) {
-        if let _ = Self.savedClientKey, !retriedWithoutClientKey {
-            let authRelated = isClientKeyAuthError(payload: payload, message: message)
-
-            Self.savedClientKey = nil
-            retriedWithoutClientKey = true
-            registerRequestId = nil
-
+        // Some TVs send pairing prompt/ack in payload
+        if let payload = dict["payload"] as? [String: Any],
+           let pairingType = payload["pairingType"] as? String,
+           pairingType == "PROMPT",
+           let key = payload["client-key"] as? String {
+            Self.savedClientKey = key
             DispatchQueue.main.async {
-                self.lastMessage = authRelated
-                    ? "TV rejected the saved access key. Approve the new pairing prompt on your TV."
-                    : "Pairing failed with the saved key. Trying again—approve the pairing request on your TV."
+                self.registered = true
+                self.isConnected = true
+                self.lastMessage = "Registered ✓"
+                self.onConnect?()
             }
-
-            performRegisterHandshake()
-            return
-        }
-        failEarly("TV error: \(message)")
-    }
-
-    private func respondToPing(id: String?) {
-        var message: [String: Any] = ["type": "pong"]
-        if let id, !id.isEmpty {
-            message["id"] = id
-        }
-        guard let data = try? JSONSerialization.data(withJSONObject: message, options: []),
-              let text = String(data: data, encoding: .utf8) else {
-            return
-        }
-        socket?.send(text, completion: nil)
-    }
-
-    private func isClientKeyAuthError(payload: [String: Any], message: String) -> Bool {
-        var codes: [Int] = []
-        let nestedPayload = payload["payload"] as? [String: Any]
-
-        let codeCandidates: [Any?] = [
-            payload["errorCode"],
-            payload["code"],
-            payload["status"],
-            payload["statusCode"],
-            nestedPayload?["errorCode"],
-            nestedPayload?["code"]
-        ]
-
-        for candidate in codeCandidates {
-            if let code = Self.parseErrorCode(candidate) {
-                codes.append(code)
-            }
-        }
-
-        if codes.contains(where: { [401, 403, -401, -403, -1000, -107, -105].contains($0) }) {
-            return true
-        }
-
-        var strings: [String] = [
-            message,
-            payload["errorText"] as? String ?? "",
-            payload["errorMessage"] as? String ?? "",
-            payload["error"] as? String ?? "",
-            payload["message"] as? String ?? ""
-        ]
-
-        if let nested = nestedPayload {
-            strings.append(contentsOf: [
-                nested["errorText"] as? String ?? "",
-                nested["errorMessage"] as? String ?? "",
-                nested["error"] as? String ?? "",
-                nested["message"] as? String ?? ""
-            ])
-        }
-
-        let keywords = [
-            "client key",
-            "client-key",
-            "unauthorized",
-            "forbidden",
-            "denied",
-            "not registered",
-            "not paired",
-            "authentication",
-            "auth failure",
-            "invalid key",
-            "invalid client",
-            "pairing key"
-        ]
-
-        for text in strings {
-            let lower = text.lowercased()
-            if keywords.contains(where: { lower.contains($0) }) {
-                return true
-            }
-        }
-        return false
-    }
-
-    private static func parseErrorCode(_ value: Any?) -> Int? {
-        switch value {
-        case let int as Int:
-            return int
-        case let number as NSNumber:
-            return number.intValue
-        case let string as String:
-            let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
-            if let int = Int(trimmed) {
-                return int
-            }
-            if trimmed.lowercased().hasPrefix("0x"),
-               let int = Int(trimmed.dropFirst(2), radix: 16) {
-                return int
-            }
-            return nil
-        default:
-            return nil
         }
     }
 
     private func failEarly(_ reason: String) {
-        let error = NSError(domain: "WebOSTV", code: -12,
-                            userInfo: [NSLocalizedDescriptionKey: reason])
-        let wasConnected = isConnected
-        cancelPendingRequests(with: error)
-
-        if shouldAutoRetry(after: nil) {
-            prepareForConnectionAttempt(andNotify: true)
-            let retryMessage = scheduleRetry(baseMessage: reason)
-            DispatchQueue.main.async {
-                if wasConnected { self.onDisconnect?() }
-                self.lastMessage = retryMessage
-                self.completeConnect(success: false, message: retryMessage)
-            }
-            return
-        }
-
-        retryStrategy = .none
-        prepareForConnectionAttempt(andNotify: true)
         DispatchQueue.main.async {
-            if wasConnected { self.onDisconnect?() }
+            self.isConnected = false
+            self.registered = false
+            self.onDisconnect?()
             self.lastMessage = reason
-            self.completeConnect(success: false, message: reason)
         }
-    }
-
-    private func completeConnect(success: Bool, message: String) {
-        guard let completion = connectCompletion else { return }
-        if success || !isAutoRetryEnabled {
-            connectCompletion = nil
-        }
-        completion(success, message)
-    }
-
-    private func resolvePending(for id: String, with result: Result<[String: Any], Error>) {
-        guard let handler = pendingResponses.removeValue(forKey: id) else { return }
-        handler(result)
-    }
-
-    private func cancelPendingRequests(with error: Error) {
-        guard !pendingResponses.isEmpty else { return }
-        let handlers = pendingResponses
-        pendingResponses.removeAll()
-        handlers.values.forEach { $0(.failure(error)) }
     }
 
     // MARK: Sending helpers
@@ -628,185 +230,43 @@ final class WebOSTV: ObservableObject {
         sock.send(text, completion: completion)
     }
 
-    /// Generic request for ssap:// URIs
     func sendSimple(uri: String, payload: [String: Any] = [:], completion: ((Error?) -> Void)? = nil) {
         guard registered else {
             completion?(NSError(domain: "WebOSTV", code: -3,
                                 userInfo: [NSLocalizedDescriptionKey: "TV not registered yet"]))
             return
         }
-        let requestId = nextRequestId("req")
         let req: [String: Any] = [
-            "id": requestId,
+            "id": nextRequestId("req"),
             "type": "request",
             "uri": uri,
             "payload": payload
         ]
-        if let handler = completion {
-            pendingResponses[requestId] = { result in
-                switch result {
-                case .success:
-                    handler(nil)
-                case .failure(let error):
-                    handler(error)
-                }
-            }
-            send(req) { error in
-                if let error {
-                    self.resolvePending(for: requestId, with: .failure(error))
-                }
-            }
-        } else {
-            send(req)
-        }
+        send(req, completion: completion)
     }
 
-    /// Remote key
     func sendButton(key: String) {
-        guard registered else {
-            DispatchQueue.main.async {
-                self.lastMessage = "Cannot send \(key) – TV not connected."
-            }
-            return
-        }
-
-        if inputRemotePrimed {
-            sendButtonCommand(key)
-            return
-        }
-
-        primeInputRemoteIfNeeded { [weak self] ready in
-            guard let self else { return }
-            if ready {
-                self.sendButtonCommand(key)
-            } else {
-                DispatchQueue.main.async {
-                    self.lastMessage = "Command \(key) aborted – remote channel unavailable."
-                }
-            }
-        }
+        sendSimple(uri: "ssap://com.webos.service.tv.inputremote/sendButton",
+                   payload: ["name": key])
     }
 
-    /// Launch app by ID
     func launchStreamingApp(_ appId: String) {
         sendSimple(uri: "ssap://system.launcher/launch",
                    payload: ["id": appId])
     }
 
-    // Legacy compatibility for PairTVView
+    // For PairTVView compatibility
     func fetchMacAddress(_ completion: @escaping (String?) -> Void) {
-          guard registered else { completion(nil); return }
-          let requestId = nextRequestId("sysinfo")
-          let request: [String: Any] = [
-              "id": requestId,
-              "type": "request",
-              "uri": "luna://com.webos.service.tv.systemproperty/getSystemInfo",
-              "payload": ["keys": ["wifiMacAddress", "wiredMacAddress"]]
-          ]
-          pendingResponses[requestId] = { result in
-              switch result {
-              case .success(let payload):
-                  let candidate = Self.extractMac(from: payload)
-                  completion(candidate?.uppercased())
-              case .failure:
-                  completion(nil)
-              }
-          }
-          send(request) { error in
-              if let error {
-                  self.resolvePending(for: requestId, with: .failure(error))
-              }
-          }
-    }
-
-      private static func extractMac(from payload: [String: Any]) -> String? {
-          if let wifi = payload["wifiMacAddress"] as? String, !wifi.isEmpty { return wifi }
-          if let wired = payload["wiredMacAddress"] as? String, !wired.isEmpty { return wired }
-          if let net = payload["networkInfo"] as? [String: Any],
-             let wifi = net["wifiMacAddress"] as? String, !wifi.isEmpty { return wifi }
-          if let sysInfo = payload["systemInfo"] as? [String: Any] {
-              return extractMac(from: sysInfo)
-          }
-          if let device = payload["device"] as? [String: Any] {
-              return extractMac(from: device)
-          }
-          return nil
-      }
-}
-
-// MARK: - Input remote helpers
-
-private extension WebOSTV {
-
-    func primeInputRemoteIfNeeded(completion: ((Bool) -> Void)? = nil) {
-        guard registered else {
-            completion?(false)
-            return
-        }
-
-        if inputRemotePrimed {
-            completion?(true)
-            return
-        }
-
-        if let completion {
-            inputRemoteWaiters.append(completion)
-        }
-
-        if inputRemotePriming {
-            return
-        }
-
-        inputRemotePriming = true
-        sendSimple(uri: "ssap://com.webos.service.tv.inputremote/register",
-                   payload: ["name": inputRemoteName]) { [weak self] error in
-            guard let self else { return }
-            let success = (error == nil)
-            self.inputRemotePriming = false
-            self.inputRemotePrimed = success
-
-            let waiters = self.inputRemoteWaiters
-            self.inputRemoteWaiters.removeAll()
-            if !waiters.isEmpty {
-                waiters.forEach { $0(success) }
-            }
-
-            if let error {
-                DispatchQueue.main.async {
-                    self.lastMessage = "Remote setup failed: \(error.localizedDescription)"
-                }
-            } else if !waiters.isEmpty {
-                DispatchQueue.main.async {
-                    self.lastMessage = "Remote ready."
-                }
-            }
-        }
-    }
-
-    func resetInputRemoteState(andNotify notify: Bool) {
-        let waiters = inputRemoteWaiters
-        inputRemotePrimed = false
-        inputRemotePriming = false
-        inputRemoteWaiters.removeAll()
-
-        if notify, !waiters.isEmpty {
-            waiters.forEach { $0(false) }
-        }
-    }
-
-    func sendButtonCommand(_ name: String) {
-        sendSimple(uri: "ssap://com.webos.service.tv.inputremote/sendButton",
-                   payload: ["name": name]) { [weak self] error in
-            guard let self else { return }
-            if let error {
-                self.inputRemotePrimed = false
-                DispatchQueue.main.async {
-                    self.lastMessage = "Command \(name) failed: \(error.localizedDescription)"
-                }
-                self.primeInputRemoteIfNeeded()
-            }
+        guard registered else { completion(nil); return }
+        let req: [String: Any] = [
+            "id": nextRequestId("sysinfo"),
+            "type": "request",
+            "uri": "luna://com.webos.service.tv.systemproperty/getSystemInfo",
+            "payload": ["keys": ["wifiMacAddress", "wiredMacAddress"]]
+        ]
+        send(req) { _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { completion(nil) }
         }
     }
 }
-
 
