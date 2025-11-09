@@ -8,6 +8,10 @@ struct SavedTV: Identifiable, Codable, Equatable {
     var ip: String
     var mac: String
     var lastSeen: Date
+
+    var displayName: String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? brand : name
+    }
 }
 
 final class SavedTVStore: ObservableObject {
@@ -32,6 +36,7 @@ final class SavedTVStore: ObservableObject {
         } else {
             items.append(tv)
         }
+        sortItems()
     }
 
     // Avoid SwiftUI’s remove(atOffsets:); do it manually so no extra import needed
@@ -40,6 +45,16 @@ final class SavedTVStore: ObservableObject {
             guard items.indices.contains(i) else { continue }
             items.remove(at: i)
         }
+    }
+
+    func markSeen(id: UUID) {
+        guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
+        items[idx].lastSeen = Date()
+        sortItems()
+    }
+
+    private func sortItems() {
+        items.sort { $0.lastSeen > $1.lastSeen }
     }
 
     private func persist() {

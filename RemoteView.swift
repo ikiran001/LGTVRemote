@@ -2,6 +2,7 @@ import SwiftUI
 
 struct RemoteView: View {
     @ObservedObject var tv: WebOSTV
+    var displayName: String? = nil
 
     // Haptics
     private let impact = UIImpactFeedbackGenerator(style: .light)
@@ -16,7 +17,7 @@ struct RemoteView: View {
                         Circle()
                             .fill(tv.isConnected ? Color.green : Color.red)
                             .frame(width: 10, height: 10)
-                        Text(tv.isConnected ? "Connected to \(tv.ip)" : "Not connected")
+                        Text(tv.isConnected ? "Connected to \(currentTargetLabel)" : "Not connected")
                             .foregroundStyle(.secondary)
                             .font(.subheadline)
                         Spacer()
@@ -97,7 +98,7 @@ struct RemoteView: View {
                                startPoint: .topLeading, endPoint: .bottomTrailing)
                     .ignoresSafeArea()
             )
-            .navigationTitle("Remote")
+            .navigationTitle(displayName ?? "Remote")
             .navigationBarTitleDisplayMode(.inline)
         }
     }
@@ -110,6 +111,12 @@ struct RemoteView: View {
     private func launch(_ appId: String) {
         guard tv.isConnected else { return }
         tv.launchStreamingApp(appId)
+    }
+
+    private var currentTargetLabel: String {
+        let fallback = tv.ip.isEmpty ? "TV" : "TV @ \(tv.ip)"
+        if let name = displayName, !name.isEmpty { return name }
+        return fallback
     }
 }
 

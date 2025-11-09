@@ -21,6 +21,8 @@ final class WebOSTV: ObservableObject {
     private var socket: WebOSSocket?
     private var nextId = 1
     private var registered = false
+    private var connectCompletion: ((Bool, String) -> Void)?
+    private var pendingResponses: [String: (Result<[String: Any], Error>) -> Void] = [:]
 
     // Persisted convenience
     static var savedIP: String?  { UserDefaults.standard.string(forKey: "LGRemoteMVP.lastIP") }
@@ -33,11 +35,14 @@ final class WebOSTV: ObservableObject {
     // MARK: Connect / Disconnect
 
     func connect(ip: String, completion: @escaping (Bool, String) -> Void) {
-        self.ip = ip
-        registered = false
-        isConnected = false
+          self.ip = ip
+          registered = false
+          isConnected = false
+          connectCompletion = completion
+          cancelPendingRequests(with: NSError(domain: "WebOSTV", code: -10,
+                                              userInfo: [NSLocalizedDescriptionKey: "New connection started"]))
 
-        socket = WebOSSocket(allowInsecureLocalTLS: true)
+          socket = WebOSSocket(allowInsecureLocalTLS: true)
 
         socket?.connect(host: ip,
                         onMessage: { [weak self] result in
@@ -52,7 +57,7 @@ final class WebOSTV: ObservableObject {
                 DispatchQueue.main.async {
                     self.isConnected = false
                     self.onDisconnect?()
-                    completion(false, err.localizedDescription)
+                      self.completeConnect(success: false, message: err.localizedDescription)
                 }
             }
         })
@@ -62,9 +67,12 @@ final class WebOSTV: ObservableObject {
         socket?.close()
         socket = nil
         registered = false
+          cancelPendingRequests(with: NSError(domain: "WebOSTV", code: -11,
+                                              userInfo: [NSLocalizedDescriptionKey: "Connection closed"]))
         DispatchQueue.main.async {
             self.isConnected = false
             self.onDisconnect?()
+              self.completeConnect(success: false, message: "Disconnected")
         }
     }
 
@@ -168,14 +176,31 @@ final class WebOSTV: ObservableObject {
                let key = payload["client-key"] as? String {
                 Self.savedClientKey = key
             }
-            DispatchQueue.main.async {
-                self.registered = true
-                self.isConnected = true
-                self.onConnect?()
-            }
-        } else if type == "error" {
-            let msg = (dict["error"] as? String) ?? "Unknown register error"
-            failEarly("TV error: \(msg)")
+              DispatchQueue.main.async {
+                  self.registered = true
+                  self.isConnected = true
+                  self.onConnect?()
+                  self.completeConnect(success: true, message: "Connected")
+              }
+          } else if type == "error" {
+              let msg = (dict["error"] as? String) ?? "Unknown register error"
+              failEarly("TV error: \(msg)")
+              if let id = dict["id"] as? String {
+                  resolvePending(for: id, with: .failure(NSError(domain: "WebOSTV", code: -5,
+                                                                 userInfo: [NSLocalizedDescriptionKey: msg])))
+              }
+          } else if type == "response", let id = dict["id"] as? String {
+              let payload = (dict["payload"] as? [String: Any]) ?? [:]
+              if let returnValue = payload["returnValue"] as? Bool, returnValue == false {
+                  let message = payload["errorText"] as? String
+                      ?? payload["errorMessage"] as? String
+                      ?? payload["error"] as? String
+                      ?? "TV returned failure"
+                  resolvePending(for: id, with: .failure(NSError(domain: "WebOSTV", code: -6,
+                                                                  userInfo: [NSLocalizedDescriptionKey: message])))
+              } else {
+                  resolvePending(for: id, with: .success(payload))
+              }
         }
     }
 
@@ -185,8 +210,29 @@ final class WebOSTV: ObservableObject {
             self.registered = false
             self.onDisconnect?()
             self.lastMessage = reason
+              self.cancelPendingRequests(with: NSError(domain: "WebOSTV", code: -12,
+                                                       userInfo: [NSLocalizedDescriptionKey: reason]))
+              self.completeConnect(success: false, message: reason)
         }
     }
+
+      private func completeConnect(success: Bool, message: String) {
+          guard let completion = connectCompletion else { return }
+          connectCompletion = nil
+          completion(success, message)
+      }
+
+      private func resolvePending(for id: String, with result: Result<[String: Any], Error>) {
+          guard let handler = pendingResponses.removeValue(forKey: id) else { return }
+          handler(result)
+      }
+
+      private func cancelPendingRequests(with error: Error) {
+          guard !pendingResponses.isEmpty else { return }
+          let handlers = pendingResponses
+          pendingResponses.removeAll()
+          handlers.values.forEach { $0(.failure(error)) }
+      }
 
     // MARK: Sending helpers
 
@@ -195,7 +241,7 @@ final class WebOSTV: ObservableObject {
         return "\(prefix)-\(nextId)"
     }
 
-    private func send(_ object: [String: Any], completion: ((Error?) -> Void)? = nil) {
+      private func send(_ object: [String: Any], completion: ((Error?) -> Void)? = nil) {
         guard registered, let sock = socket else {
             completion?(NSError(domain: "WebOSTV", code: -1,
                                 userInfo: [NSLocalizedDescriptionKey: "Not registered/connected"]))
@@ -217,13 +263,30 @@ final class WebOSTV: ObservableObject {
                                 userInfo: [NSLocalizedDescriptionKey: "TV not registered yet"]))
             return
         }
-        let req: [String: Any] = [
-            "id": nextRequestId("req"),
+          let requestId = nextRequestId("req")
+          let req: [String: Any] = [
+              "id": requestId,
             "type": "request",
             "uri": uri,
             "payload": payload
         ]
-        send(req, completion: completion)
+          if let handler = completion {
+              pendingResponses[requestId] = { result in
+                  switch result {
+                  case .success:
+                      handler(nil)
+                  case .failure(let error):
+                      handler(error)
+                  }
+              }
+              send(req) { error in
+                  if let error {
+                      self.resolvePending(for: requestId, with: .failure(error))
+                  }
+              }
+          } else {
+              send(req)
+          }
     }
 
     /// Remote key
@@ -240,16 +303,42 @@ final class WebOSTV: ObservableObject {
 
     // Legacy compatibility for PairTVView
     func fetchMacAddress(_ completion: @escaping (String?) -> Void) {
-        guard registered else { completion(nil); return }
-        let req: [String: Any] = [
-            "id": nextRequestId("sysinfo"),
-            "type": "request",
-            "uri": "luna://com.webos.service.tv.systemproperty/getSystemInfo",
-            "payload": ["keys": ["wifiMacAddress", "wiredMacAddress"]]
-        ]
-        send(req) { _ in
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { completion(nil) }
-        }
+          guard registered else { completion(nil); return }
+          let requestId = nextRequestId("sysinfo")
+          let request: [String: Any] = [
+              "id": requestId,
+              "type": "request",
+              "uri": "luna://com.webos.service.tv.systemproperty/getSystemInfo",
+              "payload": ["keys": ["wifiMacAddress", "wiredMacAddress"]]
+          ]
+          pendingResponses[requestId] = { result in
+              switch result {
+              case .success(let payload):
+                  let candidate = Self.extractMac(from: payload)
+                  completion(candidate?.uppercased())
+              case .failure:
+                  completion(nil)
+              }
+          }
+          send(request) { error in
+              if let error {
+                  self.resolvePending(for: requestId, with: .failure(error))
+              }
+          }
     }
+
+      private static func extractMac(from payload: [String: Any]) -> String? {
+          if let wifi = payload["wifiMacAddress"] as? String, !wifi.isEmpty { return wifi }
+          if let wired = payload["wiredMacAddress"] as? String, !wired.isEmpty { return wired }
+          if let net = payload["networkInfo"] as? [String: Any],
+             let wifi = net["wifiMacAddress"] as? String, !wifi.isEmpty { return wifi }
+          if let sysInfo = payload["systemInfo"] as? [String: Any] {
+              return extractMac(from: sysInfo)
+          }
+          if let device = payload["device"] as? [String: Any] {
+              return extractMac(from: device)
+          }
+          return nil
+      }
 }
 

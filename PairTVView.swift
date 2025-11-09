@@ -117,7 +117,7 @@ struct PairTVView: View {
     private func fetchMac(for ip: String) {
         autoMacStatus = "Fetching MAC…"
         let tv = WebOSTV()
-        tv.connect(ip: ip) { ok, _ in
+        tv.connect(ip: ip) { ok, message in
             if ok {
                 tv.fetchMacAddress { found in
                     DispatchQueue.main.async {
@@ -131,7 +131,9 @@ struct PairTVView: View {
                     }
                 }
             } else {
-                DispatchQueue.main.async { self.autoMacStatus = "TV not reachable" }
+                DispatchQueue.main.async {
+                    self.autoMacStatus = message.isEmpty ? "TV not reachable" : message
+                }
             }
         }
     }
