@@ -42,34 +42,10 @@ final class WebOSTV: ObservableObject {
 
     func connect(ip: String, completion: @escaping (Bool, String) -> Void) {
         self.ip = ip
-        registered = false
-        isConnected = false
         connectCompletion = completion
-        registerRequestId = nil
         retriedWithoutClientKey = false
-        cancelPendingRequests(with: NSError(domain: "WebOSTV", code: -10,
-                                            userInfo: [NSLocalizedDescriptionKey: "New connection started"]))
-
-        resetInputRemoteState(andNotify: true)
-        socket = WebOSSocket(allowInsecureLocalTLS: true)
-
-        socket?.connect(host: ip,
-                        onMessage: { [weak self] result in
-                            self?.handleSocketMessage(result)
-                        }, completion: { [weak self] result in
-                            guard let self else { return }
-                            switch result {
-                            case .success:
-                                // Socket is open; now we must REGISTER before we can send commands.
-                                self.performRegisterHandshake()
-                            case .failure(let err):
-                                DispatchQueue.main.async {
-                                    self.isConnected = false
-                                    self.onDisconnect?()
-                                    self.completeConnect(success: false, message: err.localizedDescription)
-                                }
-                            }
-                        })
+        prepareForConnectionAttempt(andNotify: true)
+        startSocketConnection()
     }
 
     func disconnect() {
@@ -88,6 +64,89 @@ final class WebOSTV: ObservableObject {
     }
 
     // MARK: Pairing / Register
+
+    private func prepareForConnectionAttempt(andNotify notify: Bool) {
+        socket?.close()
+        socket = nil
+        registered = false
+        isConnected = false
+        registerRequestId = nil
+
+        cancelPendingRequests(with: NSError(domain: "WebOSTV", code: -10,
+                                            userInfo: [NSLocalizedDescriptionKey: "New connection started"]))
+        resetInputRemoteState(andNotify: notify)
+    }
+
+    private func startSocketConnection() {
+        socket?.close()
+        let newSocket = WebOSSocket(allowInsecureLocalTLS: true)
+        socket = newSocket
+
+        newSocket.connect(host: ip,
+                          onMessage: { [weak self] result in
+                              self?.handleSocketMessage(result)
+                          }, completion: { [weak self] result in
+                              guard let self else { return }
+                              switch result {
+                              case .success:
+                                  // Socket is open; now we must REGISTER before we can send commands.
+                                  self.performRegisterHandshake()
+                              case .failure(let err):
+                                  self.handleSocketConnectFailure(err)
+                              }
+                          })
+    }
+
+    private func handleSocketConnectFailure(_ error: Error) {
+        if shouldRetryWithoutClientKey(after: error) {
+            retryConnectionWithoutClientKey(after: error)
+            return
+        }
+
+        DispatchQueue.main.async {
+            self.isConnected = false
+            self.onDisconnect?()
+            self.lastMessage = "Connection failed: \(error.localizedDescription)"
+            self.completeConnect(success: false, message: error.localizedDescription)
+        }
+    }
+
+    private func shouldRetryWithoutClientKey(after error: Error) -> Bool {
+        guard !registered,
+              !retriedWithoutClientKey,
+              registerRequestId != nil,
+              Self.savedClientKey != nil else {
+            return false
+        }
+
+        let nsError = error as NSError
+
+        if nsError.domain == URLError.errorDomain,
+           nsError.code == URLError.networkConnectionLost.rawValue {
+            return true
+        }
+
+        if nsError.domain == NSPOSIXErrorDomain,
+           nsError.code == Int(POSIXErrorCode.ECONNRESET.rawValue) {
+            return true
+        }
+
+        return false
+    }
+
+    private func retryConnectionWithoutClientKey(after error: Error) {
+        Self.savedClientKey = nil
+        retriedWithoutClientKey = true
+        prepareForConnectionAttempt(andNotify: false)
+
+        DispatchQueue.main.async {
+            self.lastMessage = "TV rejected the saved access key. Approve the new pairing request on your TV."
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            self?.startSocketConnection()
+        }
+    }
 
     private func performRegisterHandshake() {
         // If we have a client-key, send it to avoid the prompt.
