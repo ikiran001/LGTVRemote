@@ -104,7 +104,7 @@ final class LANDiscovery: ObservableObject {
         var sa = sockaddr_in()
         sa.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         sa.sin_family = sa_family_t(AF_INET)
-        sa.sin_port = in_port_t(bigEndian: port.bigEndian)
+        sa.sin_port = port.bigEndian
         sa.sin_addr = inetAddr
 
         let sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)

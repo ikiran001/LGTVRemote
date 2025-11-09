@@ -114,8 +114,8 @@ final class WebOSSocket: NSObject, URLSessionWebSocketDelegate, URLSessionDelega
         currentTask = task
 
         scheduleOverallTimer()
-        startReceiveLoop(for: task)
         task.resume()
+        startReceiveLoop(for: task)
     }
 
     private func startReceiveLoop(for task: URLSessionWebSocketTask) {
