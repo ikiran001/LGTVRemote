@@ -27,6 +27,100 @@ final class WebOSTV: ObservableObject {
     private var queuedButtons: [String] = []
     private var retryingButtonKey: String?
 
+    private struct InputRemoteService: Equatable {
+        let registerURI: String
+        let sendButtonURI: String
+    }
+
+    private struct PointerService {
+        let requestURI: String
+    }
+
+    private let inputRemoteButtonCandidates: [InputRemoteService] = [
+        InputRemoteService(
+            registerURI: "ssap://com.webos.service.tv.inputremote/register",
+            sendButtonURI: "ssap://com.webos.service.tv.inputremote/sendButton"
+        ),
+        InputRemoteService(
+            registerURI: "ssap://com.webos.service.remoteinput/register",
+            sendButtonURI: "ssap://com.webos.service.remoteinput/sendButton"
+        ),
+        InputRemoteService(
+            registerURI: "ssap://com.webos.service.tvinputremote/register",
+            sendButtonURI: "ssap://com.webos.service.tvinputremote/sendButton"
+        )
+    ]
+
+    private let pointerServiceCandidates: [PointerService] = [
+        PointerService(requestURI: "ssap://com.webos.service.tv.inputremote/getPointerInputSocket"),
+        PointerService(requestURI: "ssap://com.webos.service.networkinput/getPointerInputSocket")
+    ]
+
+    private var activeInputRemoteService: InputRemoteService?
+    private var pointerSocket: PointerSocket?
+    private struct StreamingAppFallback {
+        let alternates: [String]
+        let keywordGroups: [[String]]
+    }
+
+    private let streamingAppFallbacks: [String: StreamingAppFallback] = {
+        let prime = StreamingAppFallback(
+            alternates: ["amazon-webos", "amazon-webos-us", "primevideo", "com.amazon.amazonvideo.webos", "com.amazon.ignition", "amazonprimevideo"],
+            keywordGroups: [["prime", "video"], ["amazon", "prime"], ["prime"]]
+        )
+        let hotstar = StreamingAppFallback(
+            alternates: ["disneyplus-hotstar", "hotstar", "com.disney.disneyplus-in", "com.star.hotstar", "disney.hotstar"],
+            keywordGroups: [["hotstar"], ["disney", "hotstar"], ["disney"]]
+        )
+        let sonyLiv = StreamingAppFallback(
+            alternates: ["sonyliv-webos", "com.sonyliv", "com.sonyliv.sonyliv", "sonyliv"],
+            keywordGroups: [["sony", "liv"], ["sonyliv"], ["sony"]]
+        )
+
+        var map: [String: StreamingAppFallback] = [
+            "amzn.tvarm": prime,
+            "com.startv.hotstar.lg": hotstar,
+            "com.sonyliv.lg": sonyLiv
+        ]
+
+        ["amazon-webos", "amazon-webos-us", "primevideo", "com.amazon.amazonvideo.webos", "com.amazon.ignition", "amazonprimevideo"].forEach {
+            map[$0] = prime
+        }
+        ["disneyplus-hotstar", "hotstar", "com.disney.disneyplus-in", "com.star.hotstar", "disney.hotstar"].forEach {
+            map[$0] = hotstar
+        }
+        ["sonyliv-webos", "com.sonyliv", "com.sonyliv.sonyliv", "sonyliv"].forEach {
+            map[$0] = sonyLiv
+        }
+
+        return map
+    }()
+
+    private let streamingAppDisplayNames: [String: String] = [
+        "amzn.tvarm": "Prime Video",
+        "amazon-webos": "Prime Video",
+        "amazon-webos-us": "Prime Video",
+        "primevideo": "Prime Video",
+        "com.amazon.amazonvideo.webos": "Prime Video",
+        "com.amazon.ignition": "Prime Video",
+        "amazonprimevideo": "Prime Video",
+        "com.startv.hotstar.lg": "Disney+ Hotstar",
+        "disneyplus-hotstar": "Disney+ Hotstar",
+        "hotstar": "Disney+ Hotstar",
+        "com.disney.disneyplus-in": "Disney+ Hotstar",
+        "com.star.hotstar": "Disney+ Hotstar",
+        "disney.hotstar": "Disney+ Hotstar",
+        "com.sonyliv.lg": "Sony LIV",
+        "sonyliv-webos": "Sony LIV",
+        "com.sonyliv": "Sony LIV",
+        "com.sonyliv.sonyliv": "Sony LIV",
+        "sonyliv": "Sony LIV"
+    ]
+
+    private var launchPointsCache: [[String: Any]]?
+    private var launchPointsLoading = false
+    private var launchPointsWaiters: [(Result<[[String: Any]], Error>) -> Void] = []
+
     // Persisted convenience
     static var savedIP: String?  { UserDefaults.standard.string(forKey: "LGRemoteMVP.lastIP") }
     static var savedMAC: String? { UserDefaults.standard.string(forKey: "LGRemoteMVP.lastMAC") }
@@ -47,6 +141,12 @@ final class WebOSTV: ObservableObject {
         inputRemotePriming = false
         queuedButtons.removeAll()
         retryingButtonKey = nil
+        pointerSocket?.close()
+        pointerSocket = nil
+        activeInputRemoteService = nil
+        launchPointsCache = nil
+        launchPointsLoading = false
+        launchPointsWaiters.removeAll()
         cancelAllPendingRequests(message: "Previous requests cancelled")
         lastMessage = "Pinging \(ip)…"
 
@@ -157,6 +257,28 @@ final class WebOSTV: ObservableObject {
         message.lowercased().contains("gesture gate timed out")
     }
 
+    private func isServiceMissing(_ message: String, error: Error) -> Bool {
+        let lower = message.lowercased()
+        if lower.contains("no such service") || lower.contains("service not found") {
+            return true
+        }
+        if lower.contains("invalid request") && lower.contains("input") {
+            return true
+        }
+        if lower.contains("404") {
+            return true
+        }
+        let nsError = error as NSError
+        if let code = nsError.userInfo["errorCode"] as? Int, code == 404 {
+            return true
+        }
+        if let codeString = nsError.userInfo["errorCode"] as? String,
+           codeString == "404" {
+            return true
+        }
+        return false
+    }
+
     private func handleGestureTimeout() {
         inputRemotePrimed = false
         ensureInputRemoteReady(force: true)
@@ -167,32 +289,279 @@ final class WebOSTV: ObservableObject {
 
         if inputRemotePriming { return }
         if !force && inputRemotePrimed { return }
+        if !force, pointerSocket?.isReady == true {
+            inputRemotePrimed = true
+            return
+        }
 
         inputRemotePriming = true
-        sendSimple(uri: "ssap://com.webos.service.tv.inputremote/register") { [weak self] result in
-            guard let self else { return }
-            self.inputRemotePriming = false
 
+        if force {
+            pointerSocket?.close()
+            pointerSocket = nil
+        }
+        activeInputRemoteService = nil
+
+        primeButtonService(at: 0, collectedError: nil)
+    }
+
+    private func primeButtonService(at index: Int, collectedError: Error?) {
+        guard registered else {
+            finalizeInputRemotePrime(error: collectedError)
+            return
+        }
+
+        guard index < inputRemoteButtonCandidates.count else {
+            primePointerService(at: 0, collectedError: collectedError)
+            return
+        }
+
+        let service = inputRemoteButtonCandidates[index]
+        sendSimple(uri: service.registerURI) { [weak self] result in
+            guard let self else { return }
             switch result {
             case .success:
+                self.pointerSocket?.close()
+                self.pointerSocket = nil
+                self.activeInputRemoteService = service
                 self.inputRemotePrimed = true
-                let pending = self.queuedButtons
-                self.queuedButtons.removeAll()
-                self.retryingButtonKey = nil
-                for key in pending {
-                    self.sendButton(key: key, allowQueue: false)
-                }
+                self.inputRemotePriming = false
+                self.lastMessage = "Input remote ready (buttons)"
+                self.flushQueuedButtons()
             case .failure(let error):
-                self.inputRemotePrimed = false
-                DispatchQueue.main.async {
-                    self.lastMessage = "Input remote error: \(error.localizedDescription)"
-                }
+                self.primeButtonService(at: index + 1, collectedError: error)
             }
         }
     }
 
+    private func primePointerService(at index: Int, collectedError: Error?) {
+        guard registered else {
+            finalizeInputRemotePrime(error: collectedError)
+            return
+        }
+
+        guard !pointerServiceCandidates.isEmpty else {
+            finalizeInputRemotePrime(error: collectedError)
+            return
+        }
+
+        guard index < pointerServiceCandidates.count else {
+            finalizeInputRemotePrime(error: collectedError)
+            return
+        }
+
+        let candidate = pointerServiceCandidates[index]
+        sendSimple(uri: candidate.requestURI) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let payload):
+                let urls = self.pointerSocketURLs(from: payload)
+                guard !urls.isEmpty else {
+                    self.primePointerService(at: index + 1, collectedError: collectedError)
+                    return
+                }
+                self.openPointerSocket(with: urls) { success, error in
+                    if success {
+                        self.activeInputRemoteService = nil
+                        self.inputRemotePrimed = true
+                        self.inputRemotePriming = false
+                        self.lastMessage = "Input remote ready (pointer)"
+                        self.flushQueuedButtons()
+                    } else {
+                        self.pointerSocket = nil
+                        let aggregatedError = error ?? collectedError
+                        self.primePointerService(at: index + 1, collectedError: aggregatedError)
+                    }
+                }
+            case .failure(let error):
+                self.primePointerService(at: index + 1, collectedError: error)
+            }
+        }
+    }
+
+    private func finalizeInputRemotePrime(error: Error?) {
+        inputRemotePriming = false
+        inputRemotePrimed = false
+        activeInputRemoteService = nil
+        if let error {
+            lastMessage = "Input remote unavailable: \(error.localizedDescription)"
+        } else {
+            lastMessage = "Input remote unavailable"
+        }
+    }
+
+    private func flushQueuedButtons() {
+        guard !queuedButtons.isEmpty else { return }
+        let pending = queuedButtons
+        queuedButtons.removeAll()
+        retryingButtonKey = nil
+        for key in pending {
+            sendButton(key: key, allowQueue: false)
+        }
+    }
+
+    private func openPointerSocket(with urls: [URL], completion: @escaping (Bool, Error?) -> Void) {
+        guard !urls.isEmpty else {
+            completion(false, makeTVError("Pointer socket path missing", code: -15))
+            return
+        }
+
+        let socket = PointerSocket(host: ip, allowInsecureLocalTLS: true)
+        pointerSocket = socket
+
+        socket.onDisconnect = { [weak self, weak socket] error in
+            guard let self else { return }
+            DispatchQueue.main.async {
+                guard let socket, self.pointerSocket === socket else { return }
+                self.pointerSocket = nil
+                self.inputRemotePrimed = false
+                self.activeInputRemoteService = nil
+                if let error {
+                    self.lastMessage = "Pointer input disconnected: \(error.localizedDescription)"
+                }
+                self.ensureInputRemoteReady(force: true)
+            }
+        }
+
+        socket.connect(urls: urls) { [weak self, weak socket] success, error in
+            guard let self else { return }
+            DispatchQueue.main.async {
+                if !success, let socket, self.pointerSocket === socket {
+                    self.pointerSocket = nil
+                }
+                completion(success, error)
+            }
+        }
+    }
+
+    private func pointerSocketURLs(from payload: [String: Any]) -> [URL] {
+        var rawEntries: [String] = []
+
+        if let secure = payload["socketPathSecure"] as? String { rawEntries.append(secure) }
+        if let path = payload["socketPath"] as? String { rawEntries.append(path) }
+        if let list = payload["socketPathList"] as? [String] {
+            rawEntries.append(contentsOf: list)
+        } else if let nestedList = payload["socketPathList"] as? [[String: Any]] {
+            for entry in nestedList {
+                if let uri = entry["uri"] as? String {
+                    rawEntries.append(uri)
+                }
+                if let path = entry["path"] as? String {
+                    rawEntries.append(path)
+                }
+            }
+        }
+        if let socketPaths = payload["socketPaths"] as? [String] {
+            rawEntries.append(contentsOf: socketPaths)
+        }
+        if let socket = payload["socket"] as? String {
+            rawEntries.append(socket)
+        }
+
+        var urls: [URL] = []
+        for entry in rawEntries {
+            urls.append(contentsOf: buildPointerURLs(from: entry))
+        }
+
+        if urls.isEmpty, let address = payload["address"] as? String {
+            var ports: [Int] = []
+            if let port = payload["port"] as? Int {
+                ports.append(port)
+            } else if let portString = payload["port"] as? String, let port = Int(portString) {
+                ports.append(port)
+            }
+            if ports.isEmpty { ports = [3001, 3000] }
+            for scheme in ["wss", "ws"] {
+                for port in ports {
+                    if let url = URL(string: "\(scheme)://\(address):\(port)") {
+                        urls.append(url)
+                    }
+                }
+            }
+        }
+
+        return dedupe(urls)
+    }
+
+    private func buildPointerURLs(from raw: String) -> [URL] {
+        var trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+
+        var urls: [URL] = []
+
+        if let url = URL(string: trimmed), let scheme = url.scheme, scheme.hasPrefix("ws") {
+            if let toggled = toggleWSScheme(for: url) {
+                urls.append(toggled)
+            }
+            urls.append(url)
+            return dedupe(urls)
+        }
+
+        if trimmed.hasPrefix("//") {
+            trimmed.removeFirst(2)
+        }
+
+        if !trimmed.hasPrefix("/") {
+            trimmed = "/\(trimmed)"
+        }
+
+        for scheme in ["wss", "ws"] {
+            for port in [3001, 3000] {
+                if let url = URL(string: "\(scheme)://\(ip):\(port)\(trimmed)") {
+                    urls.append(url)
+                }
+            }
+        }
+
+        return dedupe(urls)
+    }
+
+    private func toggleWSScheme(for url: URL) -> URL? {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
+        switch components.scheme {
+        case "ws":
+            components.scheme = "wss"
+        case "wss":
+            components.scheme = "ws"
+        default:
+            return nil
+        }
+        return components.url
+    }
+
+    private func dedupe(_ urls: [URL]) -> [URL] {
+        var seen = Set<String>()
+        var result: [URL] = []
+        for url in urls {
+            let key = url.absoluteString
+            if seen.insert(key).inserted {
+                result.append(url)
+            }
+        }
+        return result
+    }
+
     private func handleCommandFailure(error: Error, key: String, allowQueue: Bool) {
         let message = error.localizedDescription
+        if allowQueue && isServiceMissing(message, error: error) {
+            if retryingButtonKey != key {
+                retryingButtonKey = key
+            }
+            if allowQueue {
+                queuedButtons.removeAll { $0 == key }
+                queuedButtons.insert(key, at: 0)
+                if queuedButtons.count > 30 {
+                    queuedButtons = Array(queuedButtons.prefix(30))
+                }
+            }
+            activeInputRemoteService = nil
+            pointerSocket?.close()
+            pointerSocket = nil
+            inputRemotePrimed = false
+            lastMessage = "Input remote service unavailable, retrying…"
+            ensureInputRemoteReady(force: true)
+            return
+        }
         if allowQueue && isGestureTimeout(message) {
             if retryingButtonKey != key {
                 retryingButtonKey = key
@@ -257,6 +626,12 @@ final class WebOSTV: ObservableObject {
         inputRemotePriming = false
         queuedButtons.removeAll()
         retryingButtonKey = nil
+        pointerSocket?.close()
+        pointerSocket = nil
+        activeInputRemoteService = nil
+        launchPointsCache = nil
+        launchPointsLoading = false
+        launchPointsWaiters.removeAll()
         cancelAllPendingRequests(message: "Disconnected")
         if connectCompletion != nil {
             completeConnect(false, "Disconnected")
@@ -332,6 +707,9 @@ final class WebOSTV: ObservableObject {
                 self.inputRemotePriming = false
                 self.queuedButtons.removeAll()
                 self.retryingButtonKey = nil
+                self.pointerSocket?.close()
+                self.pointerSocket = nil
+                self.activeInputRemoteService = nil
                 self.cancelAllPendingRequests(message: err.localizedDescription)
                 self.onDisconnect?()
                 self.lastMessage = "Socket error: \(err.localizedDescription)"
@@ -405,6 +783,12 @@ final class WebOSTV: ObservableObject {
             self.inputRemotePriming = false
             self.queuedButtons.removeAll()
             self.retryingButtonKey = nil
+            self.pointerSocket?.close()
+            self.pointerSocket = nil
+            self.activeInputRemoteService = nil
+            self.launchPointsCache = nil
+            self.launchPointsLoading = false
+            self.launchPointsWaiters.removeAll()
             self.cancelAllPendingRequests(message: reason)
             self.onDisconnect?()
             self.lastMessage = reason
@@ -474,16 +858,26 @@ final class WebOSTV: ObservableObject {
     private func sendButton(key: String, allowQueue: Bool) {
         guard registered else { return }
 
-        if allowQueue && !inputRemotePrimed {
-            queuedButtons.append(key)
-            if queuedButtons.count > 30 {
-                queuedButtons.removeFirst(queuedButtons.count - 30)
+        if let pointer = pointerSocket, pointer.isReady {
+            pointer.sendButton(key)
+            if retryingButtonKey == key {
+                retryingButtonKey = nil
             }
-            ensureInputRemoteReady()
             return
         }
 
-        sendSimple(uri: "ssap://com.webos.service.tv.inputremote/sendButton",
+        guard inputRemotePrimed, let service = activeInputRemoteService else {
+            if allowQueue {
+                queuedButtons.append(key)
+                if queuedButtons.count > 30 {
+                    queuedButtons.removeFirst(queuedButtons.count - 30)
+                }
+                ensureInputRemoteReady()
+            }
+            return
+        }
+
+        sendSimple(uri: service.sendButtonURI,
                    payload: ["name": key]) { [weak self] result in
             guard let self else { return }
             switch result {
@@ -498,8 +892,183 @@ final class WebOSTV: ObservableObject {
     }
 
     func launchStreamingApp(_ appId: String) {
+        attemptLaunch(appId: appId, originalKey: appId, tried: [])
+    }
+
+    private func attemptLaunch(appId: String, originalKey: String, tried: Set<String>) {
+        DispatchQueue.main.async {
+            self.lastMessage = "Launching \(self.displayName(for: appId))…"
+        }
         sendSimple(uri: "ssap://system.launcher/launch",
-                   payload: ["id": appId])
+                   payload: ["id": appId]) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success:
+                break
+            case .failure(let error):
+                let updatedTried = tried.union([appId.lowercased()])
+                self.handleLaunchFailure(originalKey: originalKey, tried: updatedTried, error: error)
+            }
+        }
+    }
+
+    private func handleLaunchFailure(originalKey: String, tried: Set<String>, error: Error) {
+        let message = error.localizedDescription
+        guard isRecoverableLaunchError(message, error: error) else {
+            DispatchQueue.main.async {
+                self.lastMessage = "\(self.displayName(for: originalKey)) launch failed: \(message)"
+            }
+            return
+        }
+
+        resolveNextAppId(originalKey: originalKey, tried: tried) { [weak self] nextId in
+            guard let self else { return }
+            guard let nextId else {
+                DispatchQueue.main.async {
+                    self.lastMessage = "\(self.displayName(for: originalKey)) launch failed: \(message)"
+                }
+                return
+            }
+            DispatchQueue.main.async {
+                self.lastMessage = "Retrying \(self.displayName(for: originalKey)) as \(self.displayName(for: nextId))…"
+            }
+            self.attemptLaunch(appId: nextId, originalKey: originalKey, tried: tried)
+        }
+    }
+
+    private func displayName(for appId: String) -> String {
+        let key = appId.lowercased()
+        return streamingAppDisplayNames[key] ?? appId
+    }
+
+    private func isRecoverableLaunchError(_ message: String, error: Error) -> Bool {
+        let lower = message.lowercased()
+        if lower.contains("no such app") || lower.contains("no such application") || lower.contains("not installed") || lower.contains("no such service") || lower.contains("not exist") {
+            return true
+        }
+        if lower.contains("internal server error") || lower.contains("500") || lower.contains("404") {
+            return true
+        }
+        let nsError = error as NSError
+        if let code = nsError.userInfo["errorCode"] as? Int, [404, 500].contains(code) {
+            return true
+        }
+        if let codeString = nsError.userInfo["errorCode"] as? String,
+           ["404", "500"].contains(codeString) {
+            return true
+        }
+        return false
+    }
+
+    private func resolveNextAppId(originalKey: String, tried: Set<String>, completion: @escaping (String?) -> Void) {
+        let key = originalKey.lowercased()
+        guard let fallback = streamingAppFallbacks[key] else {
+            completion(nil)
+            return
+        }
+
+        if let next = fallback.alternates.first(where: { !tried.contains($0.lowercased()) }) {
+            completion(next)
+            return
+        }
+
+        guard !fallback.keywordGroups.isEmpty else {
+            completion(nil)
+            return
+        }
+
+        fetchLaunchPoints { [weak self] result in
+            guard let self else {
+                completion(nil)
+                return
+            }
+            switch result {
+            case .success(let points):
+                let match = self.findAppId(in: points, matching: fallback.keywordGroups, excluding: tried)
+                completion(match)
+            case .failure:
+                completion(nil)
+            }
+        }
+    }
+
+    private func fetchLaunchPoints(_ completion: @escaping (Result<[[String: Any]], Error>) -> Void) {
+        if let cache = launchPointsCache {
+            completion(.success(cache))
+            return
+        }
+
+        launchPointsWaiters.append(completion)
+        guard !launchPointsLoading else { return }
+
+        launchPointsLoading = true
+        sendSimple(uri: "ssap://com.webos.applicationManager/listLaunchPoints") { [weak self] result in
+            guard let self else { return }
+            self.launchPointsLoading = false
+            switch result {
+            case .success(let payload):
+                let points = payload["launchPoints"] as? [[String: Any]] ?? []
+                self.launchPointsCache = points
+                self.launchPointsWaiters.forEach { $0(.success(points)) }
+            case .failure(let error):
+                self.launchPointsWaiters.forEach { $0(.failure(error)) }
+            }
+            self.launchPointsWaiters.removeAll()
+        }
+    }
+
+    private func findAppId(in launchPoints: [[String: Any]],
+                           matching keywordGroups: [[String]],
+                           excluding tried: Set<String>) -> String? {
+        let normalizedGroups = keywordGroups.map { group in group.map { $0.lowercased() } }
+        let flatKeywords = Set(normalizedGroups.flatMap { $0 })
+        let entries: [(id: String, title: String)] = launchPoints.compactMap { point in
+            if let id = point["id"] as? String {
+                let title = (point["title"] as? String ?? "").lowercased()
+                return (id, title)
+            }
+            if let appId = point["appId"] as? String {
+                let title = (point["title"] as? String ?? "").lowercased()
+                return (appId, title)
+            }
+            return nil
+        }
+
+        var bestMatch: (id: String, score: Int)?
+        for entry in entries {
+            if tried.contains(entry.id.lowercased()) { continue }
+            let idLower = entry.id.lowercased()
+            var score = 0
+            for group in normalizedGroups where !group.isEmpty {
+                let allMatch = group.allSatisfy { keyword in
+                    entry.title.contains(keyword) || idLower.contains(keyword)
+                }
+                if allMatch {
+                    score += 100 + group.count
+                } else {
+                    let partialCount = group.reduce(0) { partial, keyword in
+                        partial + (entry.title.contains(keyword) || idLower.contains(keyword) ? 1 : 0)
+                    }
+                    score += partialCount
+                }
+            }
+            if score == 0 && !flatKeywords.isEmpty {
+                let partialFlat = flatKeywords.reduce(0) { partial, keyword in
+                    partial + (entry.title.contains(keyword) || idLower.contains(keyword) ? 1 : 0)
+                }
+                score += partialFlat
+            }
+            if score > 0 {
+                if let best = bestMatch {
+                    if score > best.score {
+                        bestMatch = (entry.id, score)
+                    }
+                } else {
+                    bestMatch = (entry.id, score)
+                }
+            }
+        }
+        return bestMatch?.id
     }
 
     // For PairTVView compatibility
@@ -525,6 +1094,204 @@ final class WebOSTV: ObservableObject {
             DispatchQueue.main.async {
                 completion(success, message)
             }
+        }
+    }
+
+    private final class PointerSocket: NSObject, URLSessionWebSocketDelegate, URLSessionDelegate {
+
+        private let allowInsecureLocalTLS: Bool
+        private let host: String
+        private var session: URLSession!
+        private var candidateURLs: [URL] = []
+        private var currentTask: URLSessionWebSocketTask?
+        private var completion: ((Bool, Error?) -> Void)?
+        private var sendQueue: [String] = []
+        private var isOpen = false
+        private var lastError: Error?
+
+        var onDisconnect: ((Error?) -> Void)?
+
+        var isReady: Bool { isOpen }
+
+        init(host: String, allowInsecureLocalTLS: Bool) {
+            self.host = host
+            self.allowInsecureLocalTLS = allowInsecureLocalTLS
+            super.init()
+            let configuration = URLSessionConfiguration.default
+            session = URLSession(configuration: configuration, delegate: self, delegateQueue: .main)
+        }
+
+        func connect(urls: [URL], completion: @escaping (Bool, Error?) -> Void) {
+            self.completion = completion
+            candidateURLs = urls
+            lastError = nil
+            sendQueue.removeAll()
+            isOpen = false
+            attemptNextCandidate()
+        }
+
+        func sendButton(_ key: String) {
+            let payload: [String: String] = ["type": "button", "name": key]
+            guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+                  let text = String(data: data, encoding: .utf8) else { return }
+
+            sendOrQueue(text)
+        }
+
+        func close() {
+            if completion != nil {
+                let error = NSError(domain: "PointerSocket",
+                                    code: -999,
+                                    userInfo: [NSLocalizedDescriptionKey: "Pointer socket cancelled"])
+                complete(success: false, error: error)
+            }
+            onDisconnect = nil
+            candidateURLs.removeAll()
+            lastError = nil
+            isOpen = false
+            sendQueue.removeAll()
+            currentTask?.cancel(with: .goingAway, reason: nil)
+            currentTask = nil
+            session.invalidateAndCancel()
+        }
+
+        private func attemptNextCandidate() {
+            currentTask?.cancel(with: .goingAway, reason: nil)
+            currentTask = nil
+            isOpen = false
+
+            guard !candidateURLs.isEmpty else {
+                complete(success: false, error: lastError ?? NSError(domain: "PointerSocket", code: -1, userInfo: [NSLocalizedDescriptionKey: "Unable to open pointer socket"]))
+                return
+            }
+
+            let url = candidateURLs.removeFirst()
+            lastError = nil
+            let task = session.webSocketTask(with: url)
+            currentTask = task
+            task.resume()
+            receiveLoop(task)
+        }
+
+        private func receiveLoop(_ task: URLSessionWebSocketTask) {
+            task.receive { [weak self] result in
+                guard let self else { return }
+                guard task === self.currentTask else { return }
+                switch result {
+                case .success:
+                    self.receiveLoop(task)
+                case .failure(let error):
+                    if self.isOpen {
+                        self.handleDisconnect(error: error)
+                    } else {
+                        self.lastError = error
+                        self.attemptNextCandidate()
+                    }
+                }
+            }
+        }
+
+        private func flushQueuedSends() {
+            guard isOpen, let task = currentTask else { return }
+            for text in sendQueue {
+                task.send(.string(text)) { [weak self] error in
+                    guard let self, let error else { return }
+                    DispatchQueue.main.async { self.handleDisconnect(error: error) }
+                }
+            }
+            sendQueue.removeAll()
+        }
+
+        private func sendOrQueue(_ text: String) {
+            guard isOpen, let task = currentTask else {
+                sendQueue.append(text)
+                return
+            }
+            task.send(.string(text)) { [weak self] error in
+                guard let self, let error else { return }
+                DispatchQueue.main.async { self.handleDisconnect(error: error) }
+            }
+        }
+
+        private func handleDisconnect(error: Error?) {
+            currentTask?.cancel(with: .goingAway, reason: nil)
+            currentTask = nil
+            sendQueue.removeAll()
+            if isOpen {
+                isOpen = false
+                let callback = onDisconnect
+                if let callback {
+                    callback(error)
+                }
+            } else {
+                lastError = error
+                attemptNextCandidate()
+            }
+        }
+
+        private func complete(success: Bool, error: Error?) {
+            guard let completion else { return }
+            self.completion = nil
+            completion(success, error)
+        }
+
+        // MARK: URLSessionWebSocketDelegate
+
+        func urlSession(_ session: URLSession,
+                        webSocketTask: URLSessionWebSocketTask,
+                        didOpenWithProtocol protocol: String?) {
+            guard webSocketTask === currentTask else { return }
+            isOpen = true
+            lastError = nil
+            flushQueuedSends()
+            complete(success: true, error: nil)
+        }
+
+        func urlSession(_ session: URLSession,
+                        webSocketTask: URLSessionWebSocketTask,
+                        didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
+                        reason: Data?) {
+            guard webSocketTask === currentTask else { return }
+            let error = NSError(domain: "PointerSocket",
+                                code: Int(closeCode.rawValue),
+                                userInfo: [NSLocalizedDescriptionKey: "Pointer socket closed (\(closeCode.rawValue))"])
+            handleDisconnect(error: error)
+        }
+
+        func urlSession(_ session: URLSession,
+                        task: URLSessionTask,
+                        didCompleteWithError error: Error?) {
+            guard let error, task === currentTask else { return }
+            handleDisconnect(error: error)
+        }
+
+        // MARK: URLSessionDelegate
+
+        func urlSession(_ session: URLSession,
+                        didReceive challenge: URLAuthenticationChallenge,
+                        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+            let challengeHost = challenge.protectionSpace.host.isEmpty ? host : challenge.protectionSpace.host
+            guard allowInsecureLocalTLS,
+                  challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+                  let trust = challenge.protectionSpace.serverTrust,
+                  isLocalRFC1918(host: challengeHost) else {
+                completionHandler(.performDefaultHandling, nil)
+                return
+            }
+
+            completionHandler(.useCredential, URLCredential(trust: trust))
+        }
+
+        private func isLocalRFC1918(host: String) -> Bool {
+            if host.hasPrefix("10.") { return true }
+            if host.hasPrefix("192.168.") { return true }
+            if host.hasPrefix("172.") {
+                let parts = host.split(separator: ".")
+                if parts.count > 1, let second = Int(parts[1]), (16...31).contains(second) {
+                    return true
+                }
+            }
+            return false
         }
     }
 }
