@@ -1162,8 +1162,10 @@ final class WebOSTV: ObservableObject {
 
         private typealias SocketCandidate = (url: URL, protocols: [String])
 
+        // Offer at most one subprotocol name per handshake. Some TVs echo every value
+        // back in separate headers, which makes Apple's WebSocket stack reject the
+        // handshake when multiple values are present.
         private static let protocolPreference: [[String]] = [
-            ["sec-websocket-protocol", "lgtv"],
             ["sec-websocket-protocol"],
             ["lgtv"],
             []
