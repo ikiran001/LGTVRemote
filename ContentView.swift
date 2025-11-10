@@ -533,11 +533,11 @@ struct ContentView: View {
         connectStatus = .connecting(trimmedIP)
         footnote = "Connecting to \(trimmedIP)…"
 
-        tv.connect(ip: trimmedIP, retry: .untilSuccess()) { ok, message in
+        tv.connect(ip: trimmedIP) { ok, message in
             DispatchQueue.main.async {
                 if ok {
-                    connectStatus = .connected
-                    footnote = "Connected to \(connectionLabel(saved: saved, ip: trimmedIP))"
+                    self.connectStatus = .connected
+                    self.footnote = "Connected to \(connectionLabel(saved: saved, ip: trimmedIP))"
                     UserDefaults.standard.set(trimmedIP, forKey: "LGRemoteMVP.lastIP")
                     if !trimmedMAC.isEmpty {
                         UserDefaults.standard.set(trimmedMAC, forKey: "LGRemoteMVP.lastMAC")
@@ -545,25 +545,21 @@ struct ContentView: View {
                     if let saved {
                         store.markSeen(id: saved.id)
                     }
-                    if let remoteIP = pendingRemoteIP, remoteIP == trimmedIP {
-                        remoteContextName = pendingRemoteName.isEmpty
+                    if let remoteIP = self.pendingRemoteIP, remoteIP == trimmedIP {
+                        self.remoteContextName = self.pendingRemoteName.isEmpty
                             ? connectionLabel(saved: saved, ip: trimmedIP)
-                            : pendingRemoteName
-                        pendingRemoteIP = nil
-                        pendingRemoteName = ""
-                        remoteActive = true
+                            : self.pendingRemoteName
+                        self.pendingRemoteIP = nil
+                        self.pendingRemoteName = ""
+                        self.remoteActive = true
                     }
                 } else {
-                    if tv.isAutoRetryEnabled {
-                        connectStatus = .connecting(trimmedIP)
-                        footnote = message
-                    } else {
-                        connectStatus = .failed(message)
-                        footnote = "Failed: \(message)"
-                        if let remoteIP = pendingRemoteIP, remoteIP == trimmedIP {
-                            pendingRemoteIP = nil
-                            pendingRemoteName = ""
-                        }
+                    let failure = message.isEmpty ? "Failed to connect" : message
+                    self.connectStatus = .failed(failure)
+                    self.footnote = failure.hasPrefix("Failed") ? failure : "Failed: \(failure)"
+                    if let remoteIP = self.pendingRemoteIP, remoteIP == trimmedIP {
+                        self.pendingRemoteIP = nil
+                        self.pendingRemoteName = ""
                     }
                 }
             }

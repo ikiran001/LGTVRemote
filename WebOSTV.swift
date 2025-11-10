@@ -20,6 +20,7 @@ final class WebOSTV: ObservableObject {
     private var socket: WebOSSocket?
     private var nextId = 1
     private var registered = false
+    private var connectCompletion: ((Bool, String) -> Void)?
 
     // Persisted convenience
     static var savedIP: String?  { UserDefaults.standard.string(forKey: "LGRemoteMVP.lastIP") }
@@ -34,6 +35,7 @@ final class WebOSTV: ObservableObject {
     /// Connect, but first do a fast ICMP reachability check for nicer UX.
     func connect(ip: String, completion: @escaping (Bool, String) -> Void) {
         self.ip = ip
+        connectCompletion = completion
         registered = false
         isConnected = false
         lastMessage = "Pinging \(ip)…"
@@ -49,43 +51,49 @@ final class WebOSTV: ObservableObject {
                         DispatchQueue.main.async {
                             self.lastMessage = "TV at \(ip) didn’t respond on 3000/3001. Check Wi-Fi / LG Connect Apps."
                         }
-                        completion(false, "Host not reachable")
+                        self.completeConnect(false, "Host not reachable")
                         return
                     }
-                    self.openSocketAndRegister(completion: completion)
+                    self.openSocketAndRegister()
                 }
             } else {
-                self.openSocketAndRegister(completion: completion)
+                self.openSocketAndRegister()
             }
         }
     }
 
-    private func openSocketAndRegister(completion: @escaping (Bool, String) -> Void) {
+    private func openSocketAndRegister() {
         DispatchQueue.main.async { self.lastMessage = "Opening socket…" }
         socket = WebOSSocket(allowInsecureLocalTLS: true)
-        socket?.connect(host: ip,
-                        onMessage: { [weak self] result in
-            self?.handleSocketMessage(result)
-        }, completion: { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .success:
-                self.performRegisterHandshake()
-            case .failure(let err):
-                DispatchQueue.main.async {
-                    self.isConnected = false
-                    self.onDisconnect?()
-                    self.lastMessage = "Connect failed: \(err.localizedDescription)"
-                    completion(false, err.localizedDescription)
+        socket?.connect(
+            host: ip,
+            onMessage: { [weak self] result in
+                self?.handleSocketMessage(result)
+            },
+            completion: { [weak self] result in
+                guard let self else { return }
+                switch result {
+                case .success:
+                    self.performRegisterHandshake()
+                case .failure(let err):
+                    DispatchQueue.main.async {
+                        self.isConnected = false
+                        self.onDisconnect?()
+                        self.lastMessage = "Connect failed: \(err.localizedDescription)"
+                        self.completeConnect(false, err.localizedDescription)
+                    }
                 }
             }
-        })
+        )
     }
 
     func disconnect() {
         socket?.close()
         socket = nil
         registered = false
+        if connectCompletion != nil {
+            completeConnect(false, "Disconnected")
+        }
         DispatchQueue.main.async {
             self.isConnected = false
             self.onDisconnect?()
@@ -175,6 +183,7 @@ final class WebOSTV: ObservableObject {
                 self.isConnected = true
                 self.lastMessage = "Registered ✓"
                 self.onConnect?()
+                self.completeConnect(true, "Registered ✓")
             }
             return
         }
@@ -184,7 +193,6 @@ final class WebOSTV: ObservableObject {
             failEarly("TV error: \(msg)")
         }
 
-        // Some TVs send pairing prompt/ack in payload
         if let payload = dict["payload"] as? [String: Any],
            let pairingType = payload["pairingType"] as? String,
            pairingType == "PROMPT",
@@ -195,8 +203,11 @@ final class WebOSTV: ObservableObject {
                 self.isConnected = true
                 self.lastMessage = "Registered ✓"
                 self.onConnect?()
+                self.completeConnect(true, "Registered ✓")
             }
+            return
         }
+
     }
 
     private func failEarly(_ reason: String) {
@@ -205,6 +216,7 @@ final class WebOSTV: ObservableObject {
             self.registered = false
             self.onDisconnect?()
             self.lastMessage = reason
+            self.completeConnect(false, reason)
         }
     }
 
@@ -266,6 +278,18 @@ final class WebOSTV: ObservableObject {
         ]
         send(req) { _ in
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { completion(nil) }
+        }
+    }
+
+    private func completeConnect(_ success: Bool, _ message: String) {
+        guard let completion = connectCompletion else { return }
+        connectCompletion = nil
+        if Thread.isMainThread {
+            completion(success, message)
+        } else {
+            DispatchQueue.main.async {
+                completion(success, message)
+            }
         }
     }
 }

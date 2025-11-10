@@ -5,8 +5,6 @@ import SwiftUI   // for Color / ColorScheme
 /// Central user preferences (theme, accent, haptics)
 final class AppSettings: ObservableObject {
 
-    static let shared = AppSettings()
-
     @Published var theme: String {               // "system" | "light" | "dark"
         didSet { UserDefaults.standard.set(theme, forKey: "LGRemoteMVP.theme") }
     }
