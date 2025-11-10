@@ -34,15 +34,15 @@ struct RemoteView: View {
                     .padding(.horizontal)
 
                       // D-Pad (aligned using Grid)
-                      DPadGrid { dir in
-                          switch dir {
-                          case .up: sendKey("UP")
-                          case .down: sendKey("DOWN")
-                          case .left: sendKey("LEFT")
-                          case .right: sendKey("RIGHT")
-                          case .ok: sendKey("ENTER")
-                          }
-                      }
+                        DPadGrid { dir in
+                            switch dir {
+                            case .up: sendKey("UP")
+                            case .down: sendKey("DOWN")
+                            case .left: sendKey("LEFT")
+                            case .right: sendKey("RIGHT")
+                            case .ok: sendKey("OK")
+                            }
+                        }
                     .padding(.horizontal)
 
                     // Volume / Channel (long-press repeat)
