@@ -21,6 +21,11 @@ final class WebOSTV: ObservableObject {
     private var nextId = 1
     private var registered = false
     private var connectCompletion: ((Bool, String) -> Void)?
+    private var pendingResponses: [String: (Result<[String: Any], Error>) -> Void] = [:]
+    private var inputRemotePrimed = false
+    private var inputRemotePriming = false
+    private var queuedButtons: [String] = []
+    private var retryingButtonKey: String?
 
     // Persisted convenience
     static var savedIP: String?  { UserDefaults.standard.string(forKey: "LGRemoteMVP.lastIP") }
@@ -38,6 +43,11 @@ final class WebOSTV: ObservableObject {
         connectCompletion = completion
         registered = false
         isConnected = false
+        inputRemotePrimed = false
+        inputRemotePriming = false
+        queuedButtons.removeAll()
+        retryingButtonKey = nil
+        cancelAllPendingRequests(message: "Previous requests cancelled")
         lastMessage = "Pinging \(ip)…"
 
         // 1) quick reachability (uses your Ping.swift)
@@ -58,6 +68,158 @@ final class WebOSTV: ObservableObject {
                 }
             } else {
                 self.openSocketAndRegister()
+            }
+        }
+    }
+
+    private func handleResponse(id: String?, payload: [String: Any]?, dict: [String: Any]) {
+        guard let id else { return }
+        let payloadData = payload ?? [:]
+        let returnValue = (payloadData["returnValue"] as? Bool) ?? true
+
+        if returnValue {
+            _ = completeRequest(id: id, result: .success(payloadData))
+        } else {
+            let message = extractErrorMessage(dict: dict, payload: payloadData)
+            let error = makeTVError(message, code: -11, payload: payloadData)
+            let handled = completeRequest(id: id, result: .failure(error))
+            if !handled {
+                DispatchQueue.main.async {
+                    self.lastMessage = "Command failed: \(message)"
+                }
+            }
+        }
+    }
+
+    private func handleError(id: String?, payload: [String: Any]?, dict: [String: Any]) {
+        let message = extractErrorMessage(dict: dict, payload: payload)
+
+        var handled = false
+        if let id {
+            let error = makeTVError(message, code: -12, payload: payload)
+            handled = completeRequest(id: id, result: .failure(error))
+        }
+
+        if !handled && !registered {
+            failEarly("TV error: \(message)")
+        } else if !handled {
+            DispatchQueue.main.async {
+                self.lastMessage = "TV error: \(message)"
+            }
+        }
+
+        if isGestureTimeout(message) {
+            handleGestureTimeout()
+        }
+    }
+
+    @discardableResult
+    private func completeRequest(id: String, result: Result<[String: Any], Error>) -> Bool {
+        guard let handler = pendingResponses.removeValue(forKey: id) else { return false }
+        DispatchQueue.main.async {
+            handler(result)
+        }
+        return true
+    }
+
+    private func extractErrorMessage(dict: [String: Any], payload: [String: Any]?) -> String {
+        if let payload,
+           let text = payload["errorText"] as? String,
+           !text.isEmpty {
+            return text
+        }
+        if let payload,
+           let message = payload["message"] as? String,
+           !message.isEmpty {
+            return message
+        }
+        if let error = dict["error"] as? String,
+           !error.isEmpty {
+            return error
+        }
+        if let payload,
+           let code = payload["errorCode"] {
+            return "\(code)"
+        }
+        return "Unknown error"
+    }
+
+    private func makeTVError(_ message: String, code: Int = -10, payload: [String: Any]? = nil) -> NSError {
+        var userInfo: [String: Any] = [NSLocalizedDescriptionKey: message]
+        if let payload,
+           let errorCode = payload["errorCode"] {
+            userInfo["errorCode"] = errorCode
+        }
+        return NSError(domain: "WebOSTV", code: code, userInfo: userInfo)
+    }
+
+    private func isGestureTimeout(_ message: String) -> Bool {
+        message.lowercased().contains("gesture gate timed out")
+    }
+
+    private func handleGestureTimeout() {
+        inputRemotePrimed = false
+        ensureInputRemoteReady(force: true)
+    }
+
+    private func ensureInputRemoteReady(force: Bool = false) {
+        guard registered else { return }
+
+        if inputRemotePriming { return }
+        if !force && inputRemotePrimed { return }
+
+        inputRemotePriming = true
+        sendSimple(uri: "ssap://com.webos.service.tv.inputremote/register") { [weak self] result in
+            guard let self else { return }
+            self.inputRemotePriming = false
+
+            switch result {
+            case .success:
+                self.inputRemotePrimed = true
+                let pending = self.queuedButtons
+                self.queuedButtons.removeAll()
+                self.retryingButtonKey = nil
+                for key in pending {
+                    self.sendButton(key: key, allowQueue: false)
+                }
+            case .failure(let error):
+                self.inputRemotePrimed = false
+                DispatchQueue.main.async {
+                    self.lastMessage = "Input remote error: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    private func handleCommandFailure(error: Error, key: String, allowQueue: Bool) {
+        let message = error.localizedDescription
+        if allowQueue && isGestureTimeout(message) {
+            if retryingButtonKey != key {
+                retryingButtonKey = key
+                queuedButtons.insert(key, at: 0)
+            }
+            inputRemotePrimed = false
+            ensureInputRemoteReady(force: true)
+            return
+        }
+
+        if retryingButtonKey == key {
+            retryingButtonKey = nil
+        }
+
+        DispatchQueue.main.async {
+            self.lastMessage = "Command failed: \(message)"
+        }
+    }
+
+    private func cancelAllPendingRequests(message: String) {
+        guard !pendingResponses.isEmpty else { return }
+        let handlers = pendingResponses
+        pendingResponses.removeAll()
+        let error = makeTVError(message, code: -14)
+        for handler in handlers.values {
+            DispatchQueue.main.async {
+                handler(.failure(error))
             }
         }
     }
@@ -91,6 +253,11 @@ final class WebOSTV: ObservableObject {
         socket?.close()
         socket = nil
         registered = false
+        inputRemotePrimed = false
+        inputRemotePriming = false
+        queuedButtons.removeAll()
+        retryingButtonKey = nil
+        cancelAllPendingRequests(message: "Disconnected")
         if connectCompletion != nil {
             completeConnect(false, "Disconnected")
         }
@@ -161,6 +328,11 @@ final class WebOSTV: ObservableObject {
             DispatchQueue.main.async {
                 self.isConnected = false
                 self.registered = false
+                self.inputRemotePrimed = false
+                self.inputRemotePriming = false
+                self.queuedButtons.removeAll()
+                self.retryingButtonKey = nil
+                self.cancelAllPendingRequests(message: err.localizedDescription)
                 self.onDisconnect?()
                 self.lastMessage = "Socket error: \(err.localizedDescription)"
             }
@@ -173,47 +345,67 @@ final class WebOSTV: ObservableObject {
               let dict = json as? [String: Any] else { return }
 
         let type = dict["type"] as? String ?? ""
-        if type == "registered" {
-            if let payload = dict["payload"] as? [String: Any],
-               let key = payload["client-key"] as? String {
+        let id = dict["id"] as? String
+        let payload = dict["payload"] as? [String: Any]
+
+        switch type {
+        case "registered":
+            if let key = payload?["client-key"] as? String {
                 Self.savedClientKey = key
             }
             DispatchQueue.main.async {
+                let firstRegistration = !self.registered
                 self.registered = true
                 self.isConnected = true
                 self.lastMessage = "Registered ✓"
-                self.onConnect?()
-                self.completeConnect(true, "Registered ✓")
+                if firstRegistration {
+                    self.onConnect?()
+                    self.completeConnect(true, "Registered ✓")
+                    self.ensureInputRemoteReady(force: true)
+                }
             }
             return
+
+        case "response":
+            handleResponse(id: id, payload: payload, dict: dict)
+            return
+
+        case "error":
+            handleError(id: id, payload: payload, dict: dict)
+            return
+
+        default:
+            break
         }
 
-        if type == "error" {
-            let msg = (dict["error"] as? String) ?? "Unknown register error"
-            failEarly("TV error: \(msg)")
-        }
-
-        if let payload = dict["payload"] as? [String: Any],
+        if let payload,
            let pairingType = payload["pairingType"] as? String,
            pairingType == "PROMPT",
            let key = payload["client-key"] as? String {
             Self.savedClientKey = key
             DispatchQueue.main.async {
+                let firstRegistration = !self.registered
                 self.registered = true
                 self.isConnected = true
                 self.lastMessage = "Registered ✓"
-                self.onConnect?()
-                self.completeConnect(true, "Registered ✓")
+                if firstRegistration {
+                    self.onConnect?()
+                    self.completeConnect(true, "Registered ✓")
+                    self.ensureInputRemoteReady(force: true)
+                }
             }
-            return
         }
-
     }
 
     private func failEarly(_ reason: String) {
         DispatchQueue.main.async {
             self.isConnected = false
             self.registered = false
+            self.inputRemotePrimed = false
+            self.inputRemotePriming = false
+            self.queuedButtons.removeAll()
+            self.retryingButtonKey = nil
+            self.cancelAllPendingRequests(message: reason)
             self.onDisconnect?()
             self.lastMessage = reason
             self.completeConnect(false, reason)
@@ -242,24 +434,67 @@ final class WebOSTV: ObservableObject {
         sock.send(text, completion: completion)
     }
 
-    func sendSimple(uri: String, payload: [String: Any] = [:], completion: ((Error?) -> Void)? = nil) {
+    func sendSimple(uri: String,
+                    payload: [String: Any] = [:],
+                    completion: ((Result<[String: Any], Error>) -> Void)? = nil) {
         guard registered else {
-            completion?(NSError(domain: "WebOSTV", code: -3,
-                                userInfo: [NSLocalizedDescriptionKey: "TV not registered yet"]))
+            if let completion {
+                completion(.failure(makeTVError("TV not registered yet", code: -3)))
+            }
             return
         }
+
+        let requestId = nextRequestId("req")
         let req: [String: Any] = [
-            "id": nextRequestId("req"),
+            "id": requestId,
             "type": "request",
             "uri": uri,
             "payload": payload
         ]
-        send(req, completion: completion)
+
+        if let completion {
+            pendingResponses[requestId] = completion
+        }
+
+        send(req) { [weak self] error in
+            guard let self else { return }
+            if let error,
+               let handler = self.pendingResponses.removeValue(forKey: requestId) {
+                DispatchQueue.main.async {
+                    handler(.failure(error))
+                }
+            }
+        }
     }
 
     func sendButton(key: String) {
+        sendButton(key: key, allowQueue: true)
+    }
+
+    private func sendButton(key: String, allowQueue: Bool) {
+        guard registered else { return }
+
+        if allowQueue && !inputRemotePrimed {
+            queuedButtons.append(key)
+            if queuedButtons.count > 30 {
+                queuedButtons.removeFirst(queuedButtons.count - 30)
+            }
+            ensureInputRemoteReady()
+            return
+        }
+
         sendSimple(uri: "ssap://com.webos.service.tv.inputremote/sendButton",
-                   payload: ["name": key])
+                   payload: ["name": key]) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success:
+                if self.retryingButtonKey == key {
+                    self.retryingButtonKey = nil
+                }
+            case .failure(let error):
+                self.handleCommandFailure(error: error, key: key, allowQueue: allowQueue)
+            }
+        }
     }
 
     func launchStreamingApp(_ appId: String) {
