@@ -58,6 +58,7 @@ final class WebOSTV: ObservableObject {
 
     private var activeInputRemoteService: InputRemoteService?
     private var pointerSocket: PointerSocket?
+    private var clientKey: String? = WebOSTV.savedClientKey
     private struct StreamingAppFallback {
         let alternates: [String]
         let keywordGroups: [[String]]
@@ -170,6 +171,7 @@ final class WebOSTV: ObservableObject {
         pointerSocket?.close()
         pointerSocket = nil
         activeInputRemoteService = nil
+        clientKey = WebOSTV.savedClientKey
         launchPointsCache = nil
         launchPointsLoading = false
         launchPointsWaiters.removeAll()
@@ -343,7 +345,8 @@ final class WebOSTV: ObservableObject {
         }
 
         let service = inputRemoteButtonCandidates[index]
-        sendSimple(uri: service.registerURI) { [weak self] result in
+        let payload = inputRemoteRegisterPayload()
+        sendSimple(uri: service.registerURI, payload: payload) { [weak self] result in
             guard let self else { return }
             switch result {
             case .success:
@@ -432,7 +435,7 @@ final class WebOSTV: ObservableObject {
             return
         }
 
-        let socket = PointerSocket(host: ip, allowInsecureLocalTLS: true)
+        let socket = PointerSocket(host: ip, clientKey: clientKey, allowInsecureLocalTLS: true)
         pointerSocket = socket
 
         socket.onDisconnect = { [weak self, weak socket] error in
@@ -464,6 +467,11 @@ final class WebOSTV: ObservableObject {
                 completion(success, error)
             }
         }
+    }
+
+    private func inputRemoteRegisterPayload() -> [String: Any] {
+        guard let key = clientKey, !key.isEmpty else { return [:] }
+        return ["client-key": key]
     }
 
     private func pointerSocketURLs(from payload: [String: Any]) -> [URL] {
@@ -779,6 +787,7 @@ final class WebOSTV: ObservableObject {
         case "registered":
             if let key = payload?["client-key"] as? String {
                 Self.savedClientKey = key
+                self.clientKey = key
             }
             DispatchQueue.main.async {
                 let firstRegistration = !self.registered
@@ -810,6 +819,7 @@ final class WebOSTV: ObservableObject {
            pairingType == "PROMPT",
            let key = payload["client-key"] as? String {
             Self.savedClientKey = key
+            self.clientKey = key
             DispatchQueue.main.async {
                 let firstRegistration = !self.registered
                 self.registered = true
@@ -1173,6 +1183,9 @@ final class WebOSTV: ObservableObject {
 
         private let allowInsecureLocalTLS: Bool
         private let host: String
+        private let clientKey: String?
+        private let registerMessage: String?
+        private var shouldSendRegisterOnOpen = false
         private var session: URLSession!
         private var candidateQueue: [SocketCandidate] = []
         private var currentCandidate: SocketCandidate?
@@ -1186,8 +1199,10 @@ final class WebOSTV: ObservableObject {
 
         var isReady: Bool { isOpen }
 
-        init(host: String, allowInsecureLocalTLS: Bool) {
+        init(host: String, clientKey: String?, allowInsecureLocalTLS: Bool) {
             self.host = host
+            self.clientKey = clientKey
+            self.registerMessage = PointerSocket.makeRegisterMessage(clientKey: clientKey)
             self.allowInsecureLocalTLS = allowInsecureLocalTLS
             super.init()
             let configuration = URLSessionConfiguration.default
@@ -1199,6 +1214,7 @@ final class WebOSTV: ObservableObject {
             candidateQueue = buildCandidateQueue(from: urls)
             currentCandidate = nil
             lastError = nil
+            shouldSendRegisterOnOpen = registerMessage != nil
             sendQueue.removeAll()
             isOpen = false
             attemptNextCandidate()
@@ -1311,6 +1327,7 @@ final class WebOSTV: ObservableObject {
             currentTask?.cancel(with: .goingAway, reason: nil)
             currentTask = nil
             sendQueue.removeAll()
+            shouldSendRegisterOnOpen = registerMessage != nil
             if isOpen {
                 isOpen = false
                 currentCandidate = nil
@@ -1342,6 +1359,7 @@ final class WebOSTV: ObservableObject {
             guard webSocketTask === currentTask else { return }
             isOpen = true
             lastError = nil
+            sendRegisterIfNeeded(using: webSocketTask)
             flushQueuedSends()
             complete(success: true, error: nil)
         }
@@ -1404,6 +1422,25 @@ final class WebOSTV: ObservableObject {
                 }
             }
             return result
+        }
+
+        private func sendRegisterIfNeeded(using task: URLSessionWebSocketTask) {
+            guard shouldSendRegisterOnOpen, let message = registerMessage else { return }
+            shouldSendRegisterOnOpen = false
+            task.send(.string(message)) { [weak self] error in
+                guard let self, let error else { return }
+                DispatchQueue.main.async { self.handleDisconnect(error: error) }
+            }
+        }
+
+        private static func makeRegisterMessage(clientKey: String?) -> String? {
+            var payload: [String: Any] = ["type": "register"]
+            if let key = clientKey, !key.isEmpty {
+                payload["client-key"] = key
+            }
+            guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
+                  let text = String(data: data, encoding: .utf8) else { return nil }
+            return text
         }
 
         // MARK: URLSessionDelegate
