@@ -65,7 +65,11 @@ final class WebOSTV: ObservableObject {
 
     private let streamingAppFallbacks: [String: StreamingAppFallback] = {
         let prime = StreamingAppFallback(
-            alternates: ["amazon-webos", "amazon-webos-us", "primevideo", "com.amazon.amazonvideo.webos", "com.amazon.ignition", "amazonprimevideo"],
+            alternates: [
+                "amazon-webos", "amazon-webos-us", "primevideo", "com.amazon.amazonvideo.webos",
+                "com.amazon.ignition", "amazonprimevideo", "com.webos.app.amazonprimevideo",
+                "com.amazon.shoptv.webos", "primevideo-webos", "amazonprimevideo-webos"
+            ],
             keywordGroups: [["prime", "video"], ["amazon", "prime"], ["prime"]]
         )
         let hotstar = StreamingAppFallback(
@@ -73,24 +77,35 @@ final class WebOSTV: ObservableObject {
             keywordGroups: [["hotstar"], ["disney", "hotstar"], ["disney"]]
         )
         let sonyLiv = StreamingAppFallback(
-            alternates: ["sonyliv-webos", "com.sonyliv", "com.sonyliv.sonyliv", "sonyliv"],
+            alternates: ["sonyliv-webos", "com.sonyliv", "com.sonyliv.sonyliv", "sonyliv", "in.sonyliv.webos"],
             keywordGroups: [["sony", "liv"], ["sonyliv"], ["sony"]]
+        )
+        let jioCinema = StreamingAppFallback(
+            alternates: [
+                "com.jio.media.jioplay", "jiocinema", "com.jio.media.ondemand",
+                "com.jio.jioplay.tv", "com.jio.jioplay", "com.jio.media.jioplay.tv"
+            ],
+            keywordGroups: [["jio", "cinema"], ["jiocinema"], ["jio"]]
         )
 
         var map: [String: StreamingAppFallback] = [
             "amzn.tvarm": prime,
             "com.startv.hotstar.lg": hotstar,
-            "com.sonyliv.lg": sonyLiv
+            "com.sonyliv.lg": sonyLiv,
+            "com.jio.media.jioplay.tv": jioCinema
         ]
 
-        ["amazon-webos", "amazon-webos-us", "primevideo", "com.amazon.amazonvideo.webos", "com.amazon.ignition", "amazonprimevideo"].forEach {
+        ["amazon-webos", "amazon-webos-us", "primevideo", "com.amazon.amazonvideo.webos", "com.amazon.ignition", "amazonprimevideo", "com.webos.app.amazonprimevideo", "com.amazon.shoptv.webos", "primevideo-webos", "amazonprimevideo-webos"].forEach {
             map[$0] = prime
         }
         ["disneyplus-hotstar", "hotstar", "com.disney.disneyplus-in", "com.star.hotstar", "disney.hotstar"].forEach {
             map[$0] = hotstar
         }
-        ["sonyliv-webos", "com.sonyliv", "com.sonyliv.sonyliv", "sonyliv"].forEach {
+        ["sonyliv-webos", "com.sonyliv", "com.sonyliv.sonyliv", "sonyliv", "in.sonyliv.webos"].forEach {
             map[$0] = sonyLiv
+        }
+        ["com.jio.media.jioplay", "jiocinema", "com.jio.media.ondemand", "com.jio.jioplay.tv", "com.jio.jioplay", "com.jio.media.jioplay.tv"].forEach {
+            map[$0] = jioCinema
         }
 
         return map
@@ -104,6 +119,10 @@ final class WebOSTV: ObservableObject {
         "com.amazon.amazonvideo.webos": "Prime Video",
         "com.amazon.ignition": "Prime Video",
         "amazonprimevideo": "Prime Video",
+        "com.webos.app.amazonprimevideo": "Prime Video",
+        "com.amazon.shoptv.webos": "Prime Video",
+        "primevideo-webos": "Prime Video",
+        "amazonprimevideo-webos": "Prime Video",
         "com.startv.hotstar.lg": "Disney+ Hotstar",
         "disneyplus-hotstar": "Disney+ Hotstar",
         "hotstar": "Disney+ Hotstar",
@@ -114,7 +133,14 @@ final class WebOSTV: ObservableObject {
         "sonyliv-webos": "Sony LIV",
         "com.sonyliv": "Sony LIV",
         "com.sonyliv.sonyliv": "Sony LIV",
-        "sonyliv": "Sony LIV"
+        "sonyliv": "Sony LIV",
+        "in.sonyliv.webos": "Sony LIV",
+        "com.jio.media.jioplay.tv": "JioCinema",
+        "com.jio.media.jioplay": "JioCinema",
+        "jiocinema": "JioCinema",
+        "com.jio.media.ondemand": "JioCinema",
+        "com.jio.jioplay.tv": "JioCinema",
+        "com.jio.jioplay": "JioCinema"
     ]
 
     private var launchPointsCache: [[String: Any]]?
@@ -489,12 +515,29 @@ final class WebOSTV: ObservableObject {
 
         var urls: [URL] = []
 
-        if let url = URL(string: trimmed), let scheme = url.scheme, scheme.hasPrefix("ws") {
-            if let toggled = toggleWSScheme(for: url) {
-                urls.append(toggled)
+        if let url = URL(string: trimmed),
+           let scheme = url.scheme?.lowercased() {
+            switch scheme {
+            case "ws", "wss":
+                if let toggled = toggleWSScheme(for: url) {
+                    urls.append(toggled)
+                }
+                urls.append(url)
+                return dedupe(urls)
+            case "http", "https":
+                if var components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+                    components.scheme = (scheme == "http") ? "ws" : "wss"
+                    if let wsURL = components.url {
+                        urls.append(wsURL)
+                        if let toggled = toggleWSScheme(for: wsURL) {
+                            urls.append(toggled)
+                        }
+                        return dedupe(urls)
+                    }
+                }
+            default:
+                break
             }
-            urls.append(url)
-            return dedupe(urls)
         }
 
         if trimmed.hasPrefix("//") {
@@ -946,15 +989,27 @@ final class WebOSTV: ObservableObject {
         if lower.contains("no such app") || lower.contains("no such application") || lower.contains("not installed") || lower.contains("no such service") || lower.contains("not exist") {
             return true
         }
-        if lower.contains("internal server error") || lower.contains("500") || lower.contains("404") {
+        if lower.contains("internal server error") ||
+            lower.contains("internal error") ||
+            lower.contains("application error") ||
+            lower.contains("500") ||
+            lower.contains("404") {
             return true
         }
         let nsError = error as NSError
+        if (400...599).contains(nsError.code) {
+            return true
+        }
         if let code = nsError.userInfo["errorCode"] as? Int, [404, 500].contains(code) {
             return true
         }
+        if let codeNumber = nsError.userInfo["errorCode"] as? NSNumber,
+           (400...599).contains(codeNumber.intValue) {
+            return true
+        }
         if let codeString = nsError.userInfo["errorCode"] as? String,
-           ["404", "500"].contains(codeString) {
+           let numeric = Int(codeString.trimmingCharacters(in: .whitespaces)),
+           (400...599).contains(numeric) {
             return true
         }
         return false
