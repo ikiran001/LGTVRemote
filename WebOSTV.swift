@@ -443,7 +443,13 @@ final class WebOSTV: ObservableObject {
                 self.inputRemotePrimed = false
                 self.activeInputRemoteService = nil
                 if let error {
-                    self.lastMessage = "Pointer input disconnected: \(error.localizedDescription)"
+                    if let urlError = error as? URLError, urlError.code == .networkConnectionLost {
+                        self.lastMessage = "Pointer connection lost, retrying…"
+                    } else {
+                        self.lastMessage = "Pointer input disconnected: \(error.localizedDescription)"
+                    }
+                } else {
+                    self.lastMessage = "Pointer connection closed, retrying…"
                 }
                 self.ensureInputRemoteReady(force: true)
             }
@@ -519,10 +525,10 @@ final class WebOSTV: ObservableObject {
            let scheme = url.scheme?.lowercased() {
             switch scheme {
             case "ws", "wss":
+                urls.append(url)
                 if let toggled = toggleWSScheme(for: url) {
                     urls.append(toggled)
                 }
-                urls.append(url)
                 return dedupe(urls)
             case "http", "https":
                 if var components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
@@ -1154,10 +1160,20 @@ final class WebOSTV: ObservableObject {
 
     private final class PointerSocket: NSObject, URLSessionWebSocketDelegate, URLSessionDelegate {
 
+        private typealias SocketCandidate = (url: URL, protocols: [String])
+
+        private static let protocolPreference: [[String]] = [
+            ["sec-websocket-protocol", "lgtv"],
+            ["sec-websocket-protocol"],
+            ["lgtv"],
+            []
+        ]
+
         private let allowInsecureLocalTLS: Bool
         private let host: String
         private var session: URLSession!
-        private var candidateURLs: [URL] = []
+        private var candidateQueue: [SocketCandidate] = []
+        private var currentCandidate: SocketCandidate?
         private var currentTask: URLSessionWebSocketTask?
         private var completion: ((Bool, Error?) -> Void)?
         private var sendQueue: [String] = []
@@ -1178,7 +1194,8 @@ final class WebOSTV: ObservableObject {
 
         func connect(urls: [URL], completion: @escaping (Bool, Error?) -> Void) {
             self.completion = completion
-            candidateURLs = urls
+            candidateQueue = buildCandidateQueue(from: urls)
+            currentCandidate = nil
             lastError = nil
             sendQueue.removeAll()
             isOpen = false
@@ -1201,7 +1218,8 @@ final class WebOSTV: ObservableObject {
                 complete(success: false, error: error)
             }
             onDisconnect = nil
-            candidateURLs.removeAll()
+            candidateQueue.removeAll()
+            currentCandidate = nil
             lastError = nil
             isOpen = false
             sendQueue.removeAll()
@@ -1215,14 +1233,33 @@ final class WebOSTV: ObservableObject {
             currentTask = nil
             isOpen = false
 
-            guard !candidateURLs.isEmpty else {
-                complete(success: false, error: lastError ?? NSError(domain: "PointerSocket", code: -1, userInfo: [NSLocalizedDescriptionKey: "Unable to open pointer socket"]))
+            guard !candidateQueue.isEmpty else {
+                let failureError: Error
+                if let lastError {
+                    failureError = lastError
+                } else {
+                    var userInfo: [String: Any] = [NSLocalizedDescriptionKey: "Unable to open pointer socket"]
+                    if let candidate = currentCandidate {
+                        userInfo["candidateURL"] = candidate.url.absoluteString
+                        if !candidate.protocols.isEmpty {
+                            userInfo["protocols"] = candidate.protocols.joined(separator: ",")
+                        }
+                    }
+                    failureError = NSError(domain: "PointerSocket", code: -1, userInfo: userInfo)
+                }
+                complete(success: false, error: failureError)
                 return
             }
 
-            let url = candidateURLs.removeFirst()
+            let candidate = candidateQueue.removeFirst()
+            currentCandidate = candidate
             lastError = nil
-            let task = session.webSocketTask(with: url)
+            let task: URLSessionWebSocketTask
+            if candidate.protocols.isEmpty {
+                task = session.webSocketTask(with: candidate.url)
+            } else {
+                task = session.webSocketTask(with: candidate.url, protocols: candidate.protocols)
+            }
             currentTask = task
             task.resume()
             receiveLoop(task)
@@ -1274,6 +1311,7 @@ final class WebOSTV: ObservableObject {
             sendQueue.removeAll()
             if isOpen {
                 isOpen = false
+                currentCandidate = nil
                 let callback = onDisconnect
                 if let callback {
                     callback(error)
@@ -1287,6 +1325,10 @@ final class WebOSTV: ObservableObject {
         private func complete(success: Bool, error: Error?) {
             guard let completion else { return }
             self.completion = nil
+            if success {
+                candidateQueue.removeAll()
+                currentCandidate = nil
+            }
             completion(success, error)
         }
 
@@ -1318,6 +1360,48 @@ final class WebOSTV: ObservableObject {
                         didCompleteWithError error: Error?) {
             guard let error, task === currentTask else { return }
             handleDisconnect(error: error)
+        }
+
+        private func buildCandidateQueue(from urls: [URL]) -> [SocketCandidate] {
+            guard !urls.isEmpty else { return [] }
+
+            let prioritized = prioritize(urls: urls)
+            var raw: [SocketCandidate] = []
+            for url in prioritized {
+                for protocols in PointerSocket.protocolPreference {
+                    raw.append((url, protocols))
+                }
+            }
+            return dedupeCandidates(raw)
+        }
+
+        private func prioritize(urls: [URL]) -> [URL] {
+            urls.sorted { lhs, rhs in
+                schemePriority(lhs) < schemePriority(rhs)
+            }
+        }
+
+        private func schemePriority(_ url: URL) -> Int {
+            switch url.scheme?.lowercased() {
+            case "wss": return 0
+            case "ws": return 1
+            case "https": return 2
+            case "http": return 3
+            default: return 4
+            }
+        }
+
+        private func dedupeCandidates(_ candidates: [SocketCandidate]) -> [SocketCandidate] {
+            var seen = Set<String>()
+            var result: [SocketCandidate] = []
+            for candidate in candidates {
+                let protoKey = candidate.protocols.joined(separator: ",")
+                let key = candidate.url.absoluteString + "|" + protoKey
+                if seen.insert(key).inserted {
+                    result.append(candidate)
+                }
+            }
+            return result
         }
 
         // MARK: URLSessionDelegate
