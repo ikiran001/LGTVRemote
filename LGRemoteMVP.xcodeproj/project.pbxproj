@@ -26,7 +26,6 @@
 		8ACF6D5F2EBBB7CB00625C2B /* Ping.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8ACF6D5E2EBBB7C900625C2B /* Ping.swift */; };
 		8ACF6D612EBBB7E300625C2B /* AppSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8ACF6D602EBBB7DE00625C2B /* AppSettings.swift */; };
 		8ACF6D632EBBB81600625C2B /* Settings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8ACF6D622EBBB80C00625C2B /* Settings.swift */; };
-		8ACF6D6B2EBBE20E00625C2B /* VoiceControl.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8ACF6D6A2EBBE20900625C2B /* VoiceControl.swift */; };
 		8ACF6D6E2EBC732000625C2B /* WebOSSocket.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8ACF6D6D2EBC731D00625C2B /* WebOSSocket.swift */; };
 		8ACF6D702EBC759100625C2B /* NetworkInfo.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8ACF6D6F2EBC758A00625C2B /* NetworkInfo.swift */; };
 /* End PBXBuildFile section */
@@ -54,7 +53,6 @@
 		8ACF6D602EBBB7DE00625C2B /* AppSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSettings.swift; sourceTree = "<group>"; };
 		8ACF6D622EBBB80C00625C2B /* Settings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Settings.swift; sourceTree = "<group>"; };
 		8ACF6D692EBBE1CA00625C2B /* LGRemoteMVP-Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = "LGRemoteMVP-Info.plist"; sourceTree = "<group>"; };
-		8ACF6D6A2EBBE20900625C2B /* VoiceControl.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceControl.swift; sourceTree = "<group>"; };
 		8ACF6D6D2EBC731D00625C2B /* WebOSSocket.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebOSSocket.swift; sourceTree = "<group>"; };
 		8ACF6D6F2EBC758A00625C2B /* NetworkInfo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkInfo.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -84,7 +82,6 @@
 				8ACF6D4D2EBBA19A00625C2B /* KeychainStore.swift */,
 				8ACF6D4F2EBBA19A00625C2B /* LGRemoteMVPApp.swift */,
 				8ACF6D502EBBA19A00625C2B /* RemoteView.swift */,
-				8ACF6D6A2EBBE20900625C2B /* VoiceControl.swift */,
 				8ACF6D5A2EBBB49700625C2B /* SSDPDiscovery.swift */,
 				8A5955F12EBDEA6B00DBDB8B /* LocalNetworkAuthorizer.swift */,
 				8ACF6D6F2EBC758A00625C2B /* NetworkInfo.swift */,
@@ -199,7 +196,6 @@
 				8A2BE1B52ECB83030024373C /* PointerSocket.swift in Sources */,
 				8ACF6D572EBBA19A00625C2B /* ContentView.swift in Sources */,
 				8A5955F02EBDB02E00DBDB8B /* PairTVView.swift in Sources */,
-				8ACF6D6B2EBBE20E00625C2B /* VoiceControl.swift in Sources */,
 				8ACF6D5B2EBBB49F00625C2B /* SSDPDiscovery.swift in Sources */,
 				8ACF6D582EBBA19A00625C2B /* RemoteView.swift in Sources */,
 				8A5955F62EBDFB4C00DBDB8B /* BonjourDiscovery.swift in Sources */,
@@ -343,8 +339,6 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "LGRemoteMVP-Info.plist";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Scan and connect to your TV on local Wi-Fi.";
-				INFOPLIST_KEY_NSMicrophoneUsageDescription = "We need the microphone to hear your voice commands";
-				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Voice control for your TV (your speech is converted to text)";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -381,8 +375,6 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = "LGRemoteMVP-Info.plist";
 				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Scan and connect to your TV on local Wi-Fi.";
-				INFOPLIST_KEY_NSMicrophoneUsageDescription = "We need the microphone to hear your voice commands";
-				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Voice control for your TV (your speech is converted to text)";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
