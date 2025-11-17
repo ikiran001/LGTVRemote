@@ -254,14 +254,14 @@ final class WebOSTV: ObservableObject {
         return false
     }
 
-    // MARK: Button sending — FORCE pointer mode when possible
+    // MARK: Button sending — prefer button service, fallback to pointer when required
 
     func sendButton(key: String) {
         // public entry — default allow queuing
         sendButton(key: key, allowQueue: true)
     }
 
-    /// Core: always prefer pointer socket. If pointer socket missing, try to open it immediately.
+    /// Prefer the registered button service; fall back to pointer socket only when needed.
     private func sendButton(key: String, allowQueue: Bool) {
         guard registered else {
             if allowQueue {
@@ -270,20 +270,6 @@ final class WebOSTV: ObservableObject {
             return
         }
 
-        // 1) If pointer socket already ready, send directly
-        if let pointer = pointerSocket, pointer.isReady {
-            pointer.sendButton(key)
-            if retryingButtonKey == key { retryingButtonKey = nil }
-            return
-        }
-
-        // 2) Try to proactively open pointer socket (force). This will queue sends,
-        //    or return quickly if pointer not available — then fall back to input service.
-        ensurePointerSocket(force: true)
-
-        // Small window: allow pointer open attempt to complete (non-blocking).
-        // If pointer becomes ready shortly after ensurePointerSocket, flushQueue will handle it.
-        // Meanwhile, if input remote is primed and active, send using sendSimple (with retry).
         if let service = activeInputRemoteService, inputRemotePrimed {
             // attempt send using service. On server errors we will fallback to pointer in handler.
             sendSimple(uri: service.sendButtonURI, payload: ["name": key], retries: 2) { [weak self] result in
@@ -308,7 +294,13 @@ final class WebOSTV: ObservableObject {
             return
         }
 
-        // 3) If we reach here, no input service primed — enqueue or queue pointer-send
+        if let pointer = pointerSocket, pointer.isReady {
+            pointer.sendButton(key)
+            if retryingButtonKey == key { retryingButtonKey = nil }
+            return
+        }
+
+        // No transport is ready yet — enqueue and kick off registration.
         if allowQueue {
             enqueueButtonForRetry(key, prioritizingFront: false)
             ensureInputRemoteReady() // this will also attempt pointer service if buttons services fail
@@ -588,7 +580,7 @@ final class WebOSTV: ObservableObject {
         for (key, fallback) in streamingAppFallbacks {
             if tried.contains(key) { continue }
             for group in fallback.keywordGroups {
-                let matches = group.allSatisfy { lower.contains($0) || key.contains($0) }
+                let matches = group.allSatisfy { lower.contains($0) }
                 if matches && !tried.contains(key) {
                     completion(key)
                     return
@@ -736,8 +728,8 @@ final class WebOSTV: ObservableObject {
                 if firstRegistration {
                     self.onConnect?()
                     self.completeConnect(true, "Registered ✓")
-                    // proactively attempt pointer mode (helps when input services are flaky)
-                    self.ensurePointerSocket(force: true)
+                    // proactively prime input remote services so buttons are ready immediately
+                    self.ensureInputRemoteReady(force: true)
                 }
             }
             return
@@ -764,7 +756,7 @@ final class WebOSTV: ObservableObject {
                 if firstRegistration {
                     self.onConnect?()
                     self.completeConnect(true, "Registered ✓")
-                    self.ensurePointerSocket(force: true)
+                    self.ensureInputRemoteReady(force: true)
                 }
             }
         }
