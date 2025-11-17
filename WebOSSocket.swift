@@ -207,14 +207,14 @@ final class WebOSSocket: NSObject, URLSessionWebSocketDelegate {
         session = URLSession(configuration: config, delegate: self, delegateQueue: .main)
         guard let session = session else { return }
 
-        let wsTask = session.webSocketTask(with: request, protocols: supportedProtocols)
+        let wsTask = session.webSocketTask(with: url, protocols: supportedProtocols)
         task = wsTask
         isListening = false
         wsTask.resume()
 
         scheduleHandshakeTimeout(for: wsTask, url: url)
 
-        wsTask.sendPing { [weak self, weak wsTask] error in
+        wsTask.sendPing { [weak self, weak wsTask] (error: Error?) in
             guard let self = self else { return }
             DispatchQueue.main.async {
                 guard let wsTask = wsTask, self.task === wsTask else { return }
