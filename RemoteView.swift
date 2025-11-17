@@ -33,33 +33,26 @@ struct RemoteView: View {
                     }
                     .padding(.horizontal)
 
-                      // D-Pad (aligned using Grid)
-                        DPadGrid { dir in
-                            switch dir {
-                            case .up: sendKey("UP")
-                            case .down: sendKey("DOWN")
-                            case .left: sendKey("LEFT")
-                            case .right: sendKey("RIGHT")
-                            case .ok: sendKey("OK")
-                            }
-                        }
-                    .padding(.horizontal)
-
-                    // Volume / Channel (long-press repeat)
-                    HStack(spacing: 16) {
-                        VStack(spacing: 10) {
-                            Text("Volume").font(.caption).foregroundStyle(.secondary)
-                            RepeatPill(icon: "speaker.wave.3.fill", title: "Vol +") { sendKey("VOLUMEUP") }
-                            RepeatPill(icon: "speaker.wave.1.fill", title: "Vol -") { sendKey("VOLUMEDOWN") }
-                            PillButton(icon: "speaker.slash.fill", title: "Mute") { sendKey("MUTE") }
-                        }
-                        VStack(spacing: 10) {
-                            Text("Channel").font(.caption).foregroundStyle(.secondary)
-                            RepeatPill(icon: "chevron.up", title: "CH +") { sendKey("CHANNELUP") }
-                            RepeatPill(icon: "chevron.down", title: "CH -") { sendKey("CHANNELDOWN") }
-                            PillButton(icon: "rectangle.and.hand.point.up.left.filled", title: "Guide") { sendKey("GUIDE") }
+                    // D-Pad (aligned using Grid)
+                    DPadGrid { dir in
+                        switch dir {
+                        case .up: sendKey("UP")
+                        case .down: sendKey("DOWN")
+                        case .left: sendKey("LEFT")
+                        case .right: sendKey("RIGHT")
+                        case .ok: sendKey("ENTER")
                         }
                     }
+                    .padding(.horizontal)
+
+                    // Volume controls (long-press repeat)
+                    VStack(spacing: 10) {
+                        Text("Volume").font(.caption).foregroundStyle(.secondary)
+                        RepeatPill(icon: "speaker.wave.3.fill", title: "Vol +") { sendKey("VOLUMEUP") }
+                        RepeatPill(icon: "speaker.wave.1.fill", title: "Vol -") { sendKey("VOLUMEDOWN") }
+                        PillButton(icon: "speaker.slash.fill", title: "Mute") { sendKey("MUTE") }
+                    }
+                    .frame(maxWidth: .infinity)
                     .padding(.horizontal)
 
                     // Media controls
@@ -236,39 +229,46 @@ private struct AppTile: View {
     }
 }
 
-/// Grid D-pad (no absolute positions → aligns on all screens)
+/// Grid D-pad (equal-width columns keep controls centered on all devices)
 private struct DPadGrid: View {
     enum Dir { case up, down, left, right, ok }
     let tap: (Dir) -> Void
 
+    private let columns: [GridItem] = Array(repeating: GridItem(.flexible(), spacing: 12), count: 3)
+    private let arrowHeight: CGFloat = 64
+    private let okHeight: CGFloat = 92
+
     var body: some View {
-        VStack(spacing: 12) {
-              HStack(spacing: 12) {
-                  Spacer()
-                  Arrow("chevron.up") { tap(.up) }
-                  Spacer()
-              }
-              HStack(spacing: 12) {
-                  Arrow("chevron.left") { tap(.left) }
-                  OK { tap(.ok) }
-                  Arrow("chevron.right") { tap(.right) }
-              }
-              HStack(spacing: 12) {
-                  Spacer()
-                  Arrow("chevron.down") { tap(.down) }
-                  Spacer()
-              }
+        LazyVGrid(columns: columns, alignment: .center, spacing: 12) {
+            fillerCell
+            Arrow("chevron.up") { tap(.up) }
+            fillerCell
+
+            Arrow("chevron.left") { tap(.left) }
+            OK { tap(.ok) }
+            Arrow("chevron.right") { tap(.right) }
+
+            fillerCell
+            Arrow("chevron.down") { tap(.down) }
+            fillerCell
         }
     }
 
+    private var fillerCell: some View {
+        Color.clear
+            .frame(height: arrowHeight)
+    }
+
     private func Arrow(_ name: String, _ action: @escaping () -> Void) -> some View {
-          Button(action: action) {
-              RoundedRectangle(cornerRadius: 16).fill(Color.white.opacity(0.08))
+        Button(action: action) {
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(Color.white.opacity(0.08))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 16)
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
                         .stroke(Color.white.opacity(0.35), lineWidth: 1)
                 )
-                .frame(width: 92, height: 60)
+                .frame(height: arrowHeight)
+                .frame(maxWidth: .infinity)
                 .overlay(
                     Image(systemName: name)
                         .font(.system(size: 22, weight: .semibold))
@@ -279,13 +279,14 @@ private struct DPadGrid: View {
     }
 
     private func OK(_ action: @escaping () -> Void) -> some View {
-          Button(action: action) {
-              Circle()
-                  .fill(Color.white.opacity(0.1))
+        Button(action: action) {
+            Circle()
+                .fill(Color.white.opacity(0.1))
                 .overlay(Circle().stroke(Color.white.opacity(0.5), lineWidth: 1))
-                .frame(width: 90, height: 90)
+                .frame(height: okHeight)
+                .frame(maxWidth: .infinity)
                 .overlay(
-                    Image(systemName: "checkmark")
+                    Text("OK")
                         .font(.system(size: 22, weight: .bold))
                         .foregroundStyle(.white)
                 )
