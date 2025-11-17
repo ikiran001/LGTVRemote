@@ -20,14 +20,23 @@ final class WebOSSocket: NSObject, URLSessionWebSocketDelegate {
     private var onConnectHandler: ((Result<Void, Error>) -> Void)?
     private var isClosedExplicitly = false
 
-    private var candidateRequests: [URLRequest] = []
+    private struct SocketCandidate {
+        let url: URL
+        let subprotocols: [String]
+    }
+
+    private var candidateRequests: [SocketCandidate] = []
     private var currentCandidateIndex = 0
     private var handshakeTimeoutWorkItem: DispatchWorkItem?
     private var connectSuccessDelivered = false
     private var isListening = false
     private var lastConnectionError: Error?
 
-    private let supportedProtocols = ["lgtv", "lgtv-protocol"]
+    private let subprotocolAttempts: [[String]] = [
+        ["lgtv-protocol"],
+        ["lgtv"],
+        []
+    ]
 
     init(allowInsecureLocalTLS: Bool = true) {
         self.allowInsecureLocalTLS = allowInsecureLocalTLS
@@ -118,7 +127,7 @@ final class WebOSSocket: NSObject, URLSessionWebSocketDelegate {
 
     // MARK: - Candidate handling
 
-    private func buildCandidateRequests(for rawHost: String) -> [URLRequest] {
+    private func buildCandidateRequests(for rawHost: String) -> [SocketCandidate] {
         let (hostOnly, explicitPort) = splitHostAndPort(rawHost)
         guard !hostOnly.isEmpty else { return [] }
 
@@ -128,7 +137,7 @@ final class WebOSSocket: NSObject, URLSessionWebSocketDelegate {
             ports.append(defaultPort)
         }
 
-        var requests: [URLRequest] = []
+        var urls: [URL] = []
         var seen = Set<String>()
         for port in ports {
             let schemes = preferredSchemes(for: port, explicitPort: explicitPort)
@@ -136,11 +145,15 @@ final class WebOSSocket: NSObject, URLSessionWebSocketDelegate {
                 let urlString = "\(scheme)://\(hostOnly):\(port)/"
                 guard let url = URL(string: urlString) else { continue }
                 if seen.insert(url.absoluteString).inserted {
-                    var req = URLRequest(url: url)
-                    req.timeoutInterval = 8
-                    req.cachePolicy = .reloadIgnoringLocalCacheData
-                    requests.append(req)
+                    urls.append(url)
                 }
+            }
+        }
+
+        var requests: [SocketCandidate] = []
+        for url in urls {
+            for subprotocols in subprotocolAttempts {
+                requests.append(SocketCandidate(url: url, subprotocols: subprotocols))
             }
         }
         return requests
@@ -189,14 +202,11 @@ final class WebOSSocket: NSObject, URLSessionWebSocketDelegate {
             return
         }
 
-        let request = candidateRequests[currentCandidateIndex]
-        guard let url = request.url else {
-            currentCandidateIndex += 1
-            startCandidateAttempt()
-            return
-        }
+        let candidate = candidateRequests[currentCandidateIndex]
+        let url = candidate.url
+        let protocolLabel = candidate.subprotocols.isEmpty ? "none" : candidate.subprotocols.joined(separator: ",")
 
-        print("🔄 [WebOSSocket] Trying candidate: \(url.absoluteString)")
+        print("🔄 [WebOSSocket] Trying candidate: \(url.absoluteString) [protocols: \(protocolLabel)]")
 
         let config = URLSessionConfiguration.default
         config.waitsForConnectivity = false
@@ -207,14 +217,14 @@ final class WebOSSocket: NSObject, URLSessionWebSocketDelegate {
         session = URLSession(configuration: config, delegate: self, delegateQueue: .main)
         guard let session = session else { return }
 
-        let wsTask = session.webSocketTask(with: url, protocols: supportedProtocols)
+        let wsTask = session.webSocketTask(with: url, protocols: candidate.subprotocols)
         task = wsTask
         isListening = false
         wsTask.resume()
 
         scheduleHandshakeTimeout(for: wsTask, url: url)
 
-        wsTask.sendPing { [weak self, weak wsTask] (error: Error?) in
+        wsTask.sendPing(pongReceiveHandler: { [weak self, weak wsTask] error in
             guard let self = self else { return }
             DispatchQueue.main.async {
                 guard let wsTask = wsTask, self.task === wsTask else { return }
@@ -227,7 +237,7 @@ final class WebOSSocket: NSObject, URLSessionWebSocketDelegate {
                     self.handleHandshakeSuccess(url: url)
                 }
             }
-        }
+        })
     }
 
     private func scheduleHandshakeTimeout(for task: URLSessionWebSocketTask, url: URL) {
