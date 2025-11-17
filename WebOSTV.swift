@@ -4,6 +4,13 @@
 
 import Foundation
 import Combine
+// Add near top of WebOSTV class
+private let debugLogging = true
+private func logDebug(_ items: Any...) {
+    guard debugLogging else { return }
+    let s = items.map { "\($0)" }.joined(separator: " ")
+    print("[WebOSTV] \(s)")
+}
 
 final class WebOSTV: ObservableObject {
 

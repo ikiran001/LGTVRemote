@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		8A2BE1B52ECB83030024373C /* PointerSocket.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A2BE1B42ECB83020024373C /* PointerSocket.swift */; };
+		8A2BE1B72ECBB2E50024373C /* test_ws.py in Resources */ = {isa = PBXBuildFile; fileRef = 8A2BE1B62ECBB2D90024373C /* test_ws.py */; };
 		8A5955EA2EBDAFFD00DBDB8B /* SavedTVStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A5955E92EBDAFF500DBDB8B /* SavedTVStore.swift */; };
 		8A5955EC2EBDB01000DBDB8B /* HomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A5955EB2EBDB00C00DBDB8B /* HomeView.swift */; };
 		8A5955F02EBDB02E00DBDB8B /* PairTVView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8A5955EF2EBDB02D00DBDB8B /* PairTVView.swift */; };
@@ -32,6 +33,7 @@
 
 /* Begin PBXFileReference section */
 		8A2BE1B42ECB83020024373C /* PointerSocket.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PointerSocket.swift; sourceTree = "<group>"; };
+		8A2BE1B62ECBB2D90024373C /* test_ws.py */ = {isa = PBXFileReference; lastKnownFileType = text.script.python; path = test_ws.py; sourceTree = "<group>"; };
 		8A5955E92EBDAFF500DBDB8B /* SavedTVStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SavedTVStore.swift; sourceTree = "<group>"; };
 		8A5955EB2EBDB00C00DBDB8B /* HomeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeView.swift; sourceTree = "<group>"; };
 		8A5955EF2EBDB02D00DBDB8B /* PairTVView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairTVView.swift; sourceTree = "<group>"; };
@@ -88,6 +90,7 @@
 				8ACF6D6F2EBC758A00625C2B /* NetworkInfo.swift */,
 				8ACF6D512EBBA19A00625C2B /* WakeOnLAN.swift */,
 				8ACF6D6D2EBC731D00625C2B /* WebOSSocket.swift */,
+				8A2BE1B62ECBB2D90024373C /* test_ws.py */,
 				8ACF6D522EBBA19A00625C2B /* WebOSTV.swift */,
 				8A2BE1B42ECB83020024373C /* PointerSocket.swift */,
 				8ACF6D5E2EBBB7C900625C2B /* Ping.swift */,
@@ -168,6 +171,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				8A2BE1B72ECBB2E50024373C /* test_ws.py in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
