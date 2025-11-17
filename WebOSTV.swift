@@ -174,19 +174,6 @@ final class WebOSTV: ObservableObject {
             Ping.isReachable(ip: ip, port: 3000, timeout: 0.7) { [weak self] reachableLegacy in
                 guard let self else { return }
                 if reachableLegacy {
-        // quick reachability (uses Ping helper)
-        Ping.isReachable(ip: ip, port: 3000, timeout: 0.7) { [weak self] reachable in
-            guard let self else { return }
-            if !reachable {
-                Ping.isReachable(ip: ip, port: 3001, timeout: 0.7) { [weak self] reachable2 in
-                    guard let self else { return }
-                    if !reachable2 {
-                        DispatchQueue.main.async {
-                            self.lastMessage = "TV at \(ip) didn’t respond on 3000/3001. Check Wi-Fi / LG Connect Apps."
-                        }
-                        self.completeConnect(false, "Host not reachable")
-                        return
-                    }
                     self.openSocketAndRegister()
                     return
                 }
