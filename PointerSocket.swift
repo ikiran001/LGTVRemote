@@ -51,57 +51,56 @@ final class PointerSocket: NSObject, URLSessionWebSocketDelegate {
         }
 
         let url = urls[index]
-        let task = session.webSocketTask(with: url)
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 8
+        request.addValue("mouse", forHTTPHeaderField: "Sec-WebSocket-Protocol")
+
+        let task = session.webSocketTask(with: request)
         self.task = task
+        isReady = false
         task.resume()
 
-        // Give it a brief time to open and exchange messages — use receive to detect state
-        // We'll wait for either the receive to return or a short delay.
-        // If open, mark isReady and report success.
-        // If fail quickly, close and try next.
+        var finished = false
+        var timeoutWorkItem: DispatchWorkItem?
 
-        // Set a timeout guard
-        let timeout = DispatchTime.now() + .seconds(6)
-        var succeeded = false
-
-        // Start a receive loop to detect readiness (some TVs send initial messages)
-        task.receive { [weak self] result in
-            guard let self = self else { return }
-            switch result {
-            case .success(let message):
-                // Any message from server indicates liveliness. Mark ready.
-                self.isReady = true
-                succeeded = true
-                // We accept the message silently; don't crash on binary/text differences.
-                // Keep the receive loop alive on main thread
-                self.startReceiveLoop()
-                DispatchQueue.main.async { completion(true, nil) }
-            case .failure(let err):
-                // Fail this candidate and try next
-                self.task?.cancel(with: .goingAway, reason: nil)
-                self.task = nil
-                self.isReady = false
-                // try next candidate
-                self.tryConnect(urls: urls, index: index + 1, completion: completion)
-            @unknown default:
-                self.task?.cancel(with: .goingAway, reason: nil)
-                self.task = nil
-                self.isReady = false
-                self.tryConnect(urls: urls, index: index + 1, completion: completion)
-            }
+        func cleanupAndAdvance(with error: Error?) {
+            guard !finished else { return }
+            finished = true
+            timeoutWorkItem?.cancel()
+            self.task?.cancel(with: .goingAway, reason: nil)
+            self.task = nil
+            self.isReady = false
+            self.tryConnect(urls: urls, index: index + 1, completion: completion)
         }
 
-        // If we hit timeout and haven't succeeded, try next candidate
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: timeout) { [weak self] in
+        func markSuccess() {
+            guard !finished else { return }
+            finished = true
+            timeoutWorkItem?.cancel()
+            self.isReady = true
+            self.startReceiveLoop()
+            DispatchQueue.main.async { completion(true, nil) }
+        }
+
+        timeoutWorkItem = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
-            if !succeeded {
-                self.task?.cancel(with: .goingAway, reason: nil)
-                self.task = nil
-                self.isReady = false
-                DispatchQueue.main.async {
-                    self.tryConnect(urls: urls, index: index + 1, completion: completion)
-                }
+            let timeoutError = NSError(domain: "PointerSocket", code: -3,
+                                       userInfo: [NSLocalizedDescriptionKey: "Pointer socket handshake timed out"])
+            cleanupAndAdvance(with: timeoutError)
+        }
+
+        if let timeoutWorkItem {
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .seconds(6), execute: timeoutWorkItem)
+        }
+
+        task.sendPing { [weak self, weak task] error in
+            guard let self = self else { return }
+            guard let task, self.task === task else { return }
+            if let error {
+                cleanupAndAdvance(with: error)
+                return
             }
+            markSuccess()
         }
     }
 
