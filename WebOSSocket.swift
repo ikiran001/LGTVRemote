@@ -1,9 +1,9 @@
 //
-// WebOSSocket.swift
-// Robust, logging-enabled WebSocket wrapper for LG webOS sockets
+//  WebOSSocket.swift
+//  LGRemoteMVP
 //
-// Replace the existing WebOSSocket.swift with this file.
-// Expects to be used by WebOSTV.swift (send strings, receive messages).
+//  Rebuilt connector that negotiates the official LG sub-protocol
+//  and falls back through ws/wss + 3000/3001 automatically.
 //
 
 import Foundation
@@ -14,113 +14,61 @@ final class WebOSSocket: NSObject, URLSessionWebSocketDelegate {
     private(set) var allowInsecureLocalTLS: Bool = true
 
     // Internals
-    private var session: URLSession!
+    private var session: URLSession?
     private var task: URLSessionWebSocketTask?
     private var onMessageHandler: ((Result<URLSessionWebSocketTask.Message, Error>) -> Void)?
     private var onConnectHandler: ((Result<Void, Error>) -> Void)?
     private var isClosedExplicitly = false
 
+    private var candidateRequests: [URLRequest] = []
+    private var currentCandidateIndex = 0
+    private var handshakeTimeoutWorkItem: DispatchWorkItem?
+    private var connectSuccessDelivered = false
+    private var isListening = false
+    private var lastConnectionError: Error?
+
+    private let supportedProtocols = ["lgtv", "lgtv-protocol"]
+
     init(allowInsecureLocalTLS: Bool = true) {
-        super.init()
         self.allowInsecureLocalTLS = allowInsecureLocalTLS
+        super.init()
+    }
+
+    deinit {
+        teardownTask()
     }
 
     // MARK: - Connect (tries multiple candidate URLs)
 
-    /// Connect to the TV. This will attempt a small set of ws/wss + port combinations
-    /// and pick the first that responds. onMessage receives raw URLSessionWebSocketTask.Message results.
+    /// Connect to the TV. This will attempt common ws/wss + port combinations until one succeeds.
     func connect(
         host: String,
         onMessage: @escaping (Result<URLSessionWebSocketTask.Message, Error>) -> Void,
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
-        print("🔌 [WebOSSocket] FORCED connect to ws://\(host):3000")
-        self.onMessageHandler = onMessage
-        self.onConnectHandler = completion
-        self.isClosedExplicitly = false
-
-        guard let url = URL(string: "ws://\(host):3000") else {
-            completion(.failure(NSError(domain:"WebOSSocket", code:-1, userInfo:[NSLocalizedDescriptionKey:"Invalid URL"])))
+        let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedHost.isEmpty else {
+            completion(.failure(Self.makeError("Host is empty")))
             return
         }
 
-        let config = URLSessionConfiguration.default
-        self.session = URLSession(configuration: config, delegate: self, delegateQueue: .main)
-        self.task = session.webSocketTask(with: url)
-        self.task?.resume()
+        onMessageHandler = onMessage
+        onConnectHandler = completion
+        isClosedExplicitly = false
+        connectSuccessDelivered = false
+        lastConnectionError = nil
 
-        // Start listening loop (existing method in file)
-        self.listen()
+        teardownTask()
 
-        // Wait a short moment for any immediate server message, then call completion
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            completion(.success(()))
-        }
-    }
+        candidateRequests = buildCandidateRequests(for: trimmedHost)
+        currentCandidateIndex = 0
 
-
-
-    // MARK: Try candidate helper
-
-    private func tryNextCandidate(candidates: [URL], index: Int, host: String) {
-        if index >= candidates.count {
-            let err = NSError(domain: "WebOSSocket", code: -1, userInfo: [NSLocalizedDescriptionKey: "No candidate URL succeeded"])
-            print("❌ [WebOSSocket] All candidate URLs failed for host \(host)")
-            DispatchQueue.main.async { self.onConnectHandler?(.failure(err)) }
+        guard !candidateRequests.isEmpty else {
+            completion(.failure(Self.makeError("Invalid host \(trimmedHost)")))
             return
         }
 
-        let url = candidates[index]
-        print("🔄 [WebOSSocket] Trying candidate: \(url.absoluteString)")
-
-        // configure session every attempt so that delegate callback for TLS trust works
-        let config = URLSessionConfiguration.default
-        let session = URLSession(configuration: config, delegate: self, delegateQueue: .main)
-        self.session = session
-
-        self.task = session.webSocketTask(with: url)
-        self.task?.resume()
-
-        // We try to receive once to judge basic liveliness (some TVs reply immediately).
-        var attemptSucceeded = false
-
-        // If the server sends any message quickly we'll accept this candidate.
-        self.task?.receive { [weak self] result in
-            guard let self = self else { return }
-            switch result {
-            case .success(let msg):
-                attemptSucceeded = true
-                print("⬅️ [WebOSSocket] candidate success. First message: \(msg)")
-                // deliver first message to handler
-                self.onMessageHandler?(Result.success(msg))
-                // Switch to continuous listen loop
-                self.listen()
-                DispatchQueue.main.async { self.onConnectHandler?(.success(())) }
-            case .failure(let err):
-                // Candidate failed - close and try next
-                print("❌ [WebOSSocket] candidate \(url.absoluteString) failed with error: \(err.localizedDescription)")
-                self.task?.cancel(with: .goingAway, reason: nil)
-                self.task = nil
-                // small delay then try next candidate
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
-                    self.tryNextCandidate(candidates: candidates, index: index + 1, host: host)
-                }
-            }
-        }
-
-        // Timeout guard: if no message within this short window, try next
-        let timeout = DispatchTime.now() + .milliseconds(2500)
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: timeout) { [weak self] in
-            guard let self = self else { return }
-            if !attemptSucceeded {
-                print("⏱ [WebOSSocket] candidate \(url.absoluteString) timed out, trying next")
-                self.task?.cancel(with: .goingAway, reason: nil)
-                self.task = nil
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                    self.tryNextCandidate(candidates: candidates, index: index + 1, host: host)
-                }
-            }
-        }
+        startCandidateAttempt()
     }
 
     // MARK: - Send helpers
@@ -140,46 +88,16 @@ final class WebOSSocket: NSObject, URLSessionWebSocketDelegate {
         }
     }
 
-    // Continuous receive loop
-    private func listen() {
-        guard let task = task else { return }
-        task.receive { [weak self] result in
-            guard let self = self else { return }
-            switch result {
-            case .success(let msg):
-                // Log message contents
-                switch msg {
-                case .string(let s): print("⬅️ [WebOSSocket ← IN (text)] \(s)")
-                case .data(let d): print("⬅️ [WebOSSocket ← IN (data)] length=\(d.count)")
-                @unknown default: print("⬅️ [WebOSSocket ← IN] unknown message type")
-                }
-                self.onMessageHandler?(Result.success(msg))
-                // continue listening
-                self.listen()
-            case .failure(let err):
-                print("❌ [WebOSSocket] Receive error: \(err.localizedDescription)")
-                // close task and notify handler
-                self.onMessageHandler?(Result.failure(err))
-                // if not closed explicitly, call onConnectHandler failure so callers know
-                if !self.isClosedExplicitly {
-                    DispatchQueue.main.async {
-                        self.onConnectHandler?(.failure(err))
-                    }
-                }
-                // cleanup
-                self.task?.cancel(with: .goingAway, reason: nil)
-                self.task = nil
-            }
-        }
-    }
+    // MARK: - Close
 
-    // Close gently
     func close() {
         print("🛑 [WebOSSocket] Closing socket (explicit)")
         isClosedExplicitly = true
-        task?.cancel(with: .goingAway, reason: nil)
-        task = nil
-        session = nil
+        connectSuccessDelivered = false
+        candidateRequests.removeAll()
+        currentCandidateIndex = 0
+        lastConnectionError = nil
+        teardownTask()
     }
 
     // MARK: - URLSessionWebSocketDelegate (TLS trust for local IPs)
@@ -195,8 +113,229 @@ final class WebOSSocket: NSObject, URLSessionWebSocketDelegate {
             return
         }
 
-        // Accept the local self-signed / internal cert for RFC1918 hosts
         completionHandler(.useCredential, URLCredential(trust: trust))
+    }
+
+    // MARK: - Candidate handling
+
+    private func buildCandidateRequests(for rawHost: String) -> [URLRequest] {
+        let (hostOnly, explicitPort) = splitHostAndPort(rawHost)
+        guard !hostOnly.isEmpty else { return [] }
+
+        var ports: [Int] = []
+        if let explicitPort = explicitPort { ports.append(explicitPort) }
+        for defaultPort in [3000, 3001] where !ports.contains(defaultPort) {
+            ports.append(defaultPort)
+        }
+
+        var requests: [URLRequest] = []
+        var seen = Set<String>()
+        for port in ports {
+            let schemes = preferredSchemes(for: port, explicitPort: explicitPort)
+            for scheme in schemes {
+                let urlString = "\(scheme)://\(hostOnly):\(port)/"
+                guard let url = URL(string: urlString) else { continue }
+                if seen.insert(url.absoluteString).inserted {
+                    var req = URLRequest(url: url)
+                    req.timeoutInterval = 8
+                    req.cachePolicy = .reloadIgnoringLocalCacheData
+                    requests.append(req)
+                }
+            }
+        }
+        return requests
+    }
+
+    private func preferredSchemes(for port: Int, explicitPort: Int?) -> [String] {
+        if let explicitPort = explicitPort, explicitPort == port {
+            return port == 3001 ? ["wss", "ws"] : ["ws", "wss"]
+        }
+        return port == 3001 ? ["wss", "ws"] : ["ws", "wss"]
+    }
+
+    private func splitHostAndPort(_ raw: String) -> (String, Int?) {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return ("", nil) }
+
+        if trimmed.contains("://"), let comps = URLComponents(string: trimmed) {
+            let host = comps.host ?? ""
+            return (host.isEmpty ? trimmed : host, comps.port)
+        }
+
+        if trimmed.first == "[", let closing = trimmed.firstIndex(of: "]") {
+            let host = String(trimmed[trimmed.startIndex...closing])
+            let remainder = trimmed[trimmed.index(after: closing)...]
+            if remainder.first == ":", let port = Int(remainder.dropFirst()) {
+                return (host, port)
+            }
+            return (host, nil)
+        }
+
+        if let colon = trimmed.lastIndex(of: ":"), colon != trimmed.startIndex {
+            let portSubstring = trimmed[trimmed.index(after: colon)...]
+            if portSubstring.allSatisfy({ $0.isNumber }), let port = Int(portSubstring) {
+                let hostPart = trimmed[..<colon]
+                return (String(hostPart), port)
+            }
+        }
+
+        return (trimmed, nil)
+    }
+
+    private func startCandidateAttempt() {
+        guard !isClosedExplicitly else { return }
+        guard currentCandidateIndex < candidateRequests.count else {
+            notifyConnectFailureUsingLastError()
+            return
+        }
+
+        let request = candidateRequests[currentCandidateIndex]
+        guard let url = request.url else {
+            currentCandidateIndex += 1
+            startCandidateAttempt()
+            return
+        }
+
+        print("🔄 [WebOSSocket] Trying candidate: \(url.absoluteString)")
+
+        let config = URLSessionConfiguration.default
+        config.waitsForConnectivity = false
+        config.timeoutIntervalForRequest = 8
+        config.timeoutIntervalForResource = 8
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+
+        session = URLSession(configuration: config, delegate: self, delegateQueue: .main)
+        guard let session = session else { return }
+
+        let wsTask = session.webSocketTask(with: request, protocols: supportedProtocols)
+        task = wsTask
+        isListening = false
+        wsTask.resume()
+
+        scheduleHandshakeTimeout(for: wsTask, url: url)
+
+        wsTask.sendPing { [weak self, weak wsTask] error in
+            guard let self = self else { return }
+            DispatchQueue.main.async {
+                guard let wsTask = wsTask, self.task === wsTask else { return }
+                self.handshakeTimeoutWorkItem?.cancel()
+                self.handshakeTimeoutWorkItem = nil
+                if let error = error {
+                    print("❌ [WebOSSocket] \(url.absoluteString) ping failed: \(error.localizedDescription)")
+                    self.advanceCandidate(after: error)
+                } else {
+                    self.handleHandshakeSuccess(url: url)
+                }
+            }
+        }
+    }
+
+    private func scheduleHandshakeTimeout(for task: URLSessionWebSocketTask, url: URL) {
+        handshakeTimeoutWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self, weak task] in
+            guard let self = self else { return }
+            guard let task = task, self.task === task else { return }
+            guard !self.connectSuccessDelivered, !self.isClosedExplicitly else { return }
+            print("⏱ [WebOSSocket] \(url.absoluteString) handshake timed out")
+            let timeoutError = Self.makeError("Handshake timed out", code: -2)
+            self.advanceCandidate(after: timeoutError)
+        }
+        handshakeTimeoutWorkItem = workItem
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 4, execute: workItem)
+    }
+
+    private func handleHandshakeSuccess(url: URL) {
+        print("✅ [WebOSSocket] Connected via \(url.absoluteString)")
+        if !isListening {
+            listen()
+        }
+        if !connectSuccessDelivered {
+            connectSuccessDelivered = true
+            DispatchQueue.main.async {
+                self.onConnectHandler?(.success(()))
+            }
+        }
+    }
+
+    private func advanceCandidate(after error: Error) {
+        lastConnectionError = error
+        handshakeTimeoutWorkItem?.cancel()
+        handshakeTimeoutWorkItem = nil
+        teardownTask()
+
+        guard !isClosedExplicitly else { return }
+
+        currentCandidateIndex += 1
+        if currentCandidateIndex < candidateRequests.count {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+                self?.startCandidateAttempt()
+            }
+        } else if !connectSuccessDelivered {
+            DispatchQueue.main.async {
+                self.onConnectHandler?(.failure(error))
+            }
+        }
+    }
+
+    private func notifyConnectFailureUsingLastError() {
+        guard !connectSuccessDelivered else { return }
+        let error = lastConnectionError ?? Self.makeError("No candidate URL succeeded")
+        DispatchQueue.main.async {
+            self.onConnectHandler?(.failure(error))
+        }
+    }
+
+    // MARK: - Receive loop
+
+    private func listen() {
+        guard let task = task else {
+            isListening = false
+            return
+        }
+        isListening = true
+        task.receive { [weak self] result in
+            guard let self = self else { return }
+            switch result {
+            case .success(let msg):
+                switch msg {
+                case .string(let s): print("⬅️ [WebOSSocket ← IN (text)] \(s)")
+                case .data(let d): print("⬅️ [WebOSSocket ← IN (data)] length=\(d.count)")
+                @unknown default: print("⬅️ [WebOSSocket ← IN] unknown message type")
+                }
+                self.onMessageHandler?(Result.success(msg))
+                self.listen()
+            case .failure(let err):
+                self.isListening = false
+                print("❌ [WebOSSocket] Receive error: \(err.localizedDescription)")
+                if !self.isClosedExplicitly {
+                    self.onMessageHandler?(Result.failure(err))
+                }
+                if !self.isClosedExplicitly && !self.connectSuccessDelivered {
+                    DispatchQueue.main.async {
+                        self.onConnectHandler?(.failure(err))
+                    }
+                }
+                self.teardownTask()
+            }
+        }
+    }
+
+    private func teardownTask() {
+        handshakeTimeoutWorkItem?.cancel()
+        handshakeTimeoutWorkItem = nil
+        isListening = false
+        if let task = task {
+            task.cancel(with: .goingAway, reason: nil)
+        }
+        task = nil
+        session?.invalidateAndCancel()
+        session = nil
+    }
+
+    // MARK: - Helpers
+
+    private static func makeError(_ message: String, code: Int = -1) -> NSError {
+        NSError(domain: "WebOSSocket", code: code, userInfo: [NSLocalizedDescriptionKey: message])
     }
 
     private func isLocalRFC1918(host: String) -> Bool {
