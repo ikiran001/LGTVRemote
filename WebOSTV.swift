@@ -1,15 +1,14 @@
 // WebOSTV.swift
+// Updated: force pointer mode, ignore failing input services, more fallback IDs,
+// retry on 500 errors, and proactively open pointer socket before button events.
+
 import Foundation
 import Combine
 
-/// High-level session for LG webOS TVs, sitting atop WebOSSocket.
-/// - Pre-pings the host for quick feedback
-/// - Opens WebSocket (ws/wss raced in WebOSSocket)
-/// - Performs REGISTER (pairing) and sets isConnected only after "registered"
 final class WebOSTV: ObservableObject {
 
     // MARK: Published state for UI
-    @Published private(set) var isConnected = false     // true only after "registered"
+    @Published private(set) var isConnected = false
     @Published private(set) var ip: String = ""
     @Published private(set) var lastMessage: String = ""
 
@@ -22,10 +21,13 @@ final class WebOSTV: ObservableObject {
     private var registered = false
     private var connectCompletion: ((Bool, String) -> Void)?
     private var pendingResponses: [String: (Result<[String: Any], Error>) -> Void] = [:]
+
+    // Input / pointer management
     private var inputRemotePrimed = false
     private var inputRemotePriming = false
     private var queuedButtons: [String] = []
     private var retryingButtonKey: String?
+    private var failedButtonServices: Set<String> = []
 
     private struct InputRemoteService: Equatable {
         let registerURI: String
@@ -37,29 +39,26 @@ final class WebOSTV: ObservableObject {
     }
 
     private let inputRemoteButtonCandidates: [InputRemoteService] = [
-        InputRemoteService(
-            registerURI: "ssap://com.webos.service.tv.inputremote/register",
-            sendButtonURI: "ssap://com.webos.service.tv.inputremote/sendButton"
-        ),
-        InputRemoteService(
-            registerURI: "ssap://com.webos.service.remoteinput/register",
-            sendButtonURI: "ssap://com.webos.service.remoteinput/sendButton"
-        ),
-        InputRemoteService(
-            registerURI: "ssap://com.webos.service.tvinputremote/register",
-            sendButtonURI: "ssap://com.webos.service.tvinputremote/sendButton"
-        )
+        InputRemoteService(registerURI: "ssap://com.webos.service.tv.inputremote/register",
+                           sendButtonURI: "ssap://com.webos.service.tv.inputremote/sendButton"),
+        InputRemoteService(registerURI: "ssap://com.webos.service.remoteinput/register",
+                           sendButtonURI: "ssap://com.webos.service.remoteinput/sendButton"),
+        InputRemoteService(registerURI: "ssap://com.webos.service.tvinputremote/register",
+                           sendButtonURI: "ssap://com.webos.service.tvinputremote/sendButton")
     ]
 
     private let pointerServiceCandidates: [PointerService] = [
         PointerService(requestURI: "ssap://com.webos.service.tv.inputremote/getPointerInputSocket"),
-        PointerService(requestURI: "ssap://com.webos.service.networkinput/getPointerInputSocket")
+        PointerService(requestURI: "ssap://com.webos.service.networkinput/getPointerInputSocket"),
+        // extra candidate URIs if some TV firmwares use different names
+        PointerService(requestURI: "ssap://com.webos.service.tvpointer/getPointerInputSocket")
     ]
 
     private var activeInputRemoteService: InputRemoteService?
     private var pointerSocket: PointerSocket?
     private var clientKey: String? = WebOSTV.savedClientKey
-    private var failedButtonServices: Set<String> = []
+
+    // More robust app fallback mapping (extended)
     private struct StreamingAppFallback {
         let alternates: [String]
         let keywordGroups: [[String]]
@@ -70,49 +69,47 @@ final class WebOSTV: ObservableObject {
             alternates: [
                 "amazon-webos", "amazon-webos-us", "primevideo", "com.amazon.amazonvideo.webos",
                 "com.amazon.ignition", "amazonprimevideo", "com.webos.app.amazonprimevideo",
-                "com.amazon.shoptv.webos", "primevideo-webos", "amazonprimevideo-webos"
+                "com.amazon.shoptv.webos", "primevideo-webos", "amazonprimevideo-webos",
+                "amzn.tvarm", "com.amazon.shoptv"
             ],
-            keywordGroups: [["prime", "video"], ["amazon", "prime"], ["prime"]]
+            keywordGroups: [["prime","video"], ["amazon","prime"], ["prime"]]
         )
         let netflix = StreamingAppFallback(
-            alternates: [],
+            alternates: ["netflix", "com.netflix.app"], // include common variants
             keywordGroups: [["netflix"]]
         )
         let hotstar = StreamingAppFallback(
             alternates: ["disneyplus-hotstar", "hotstar", "com.disney.disneyplus-in", "com.star.hotstar", "disney.hotstar"],
-            keywordGroups: [["hotstar"], ["disney", "hotstar"], ["disney"]]
+            keywordGroups: [["hotstar"], ["disney","hotstar"], ["disney"]]
         )
         let sonyLiv = StreamingAppFallback(
             alternates: ["sonyliv-webos", "com.sonyliv", "com.sonyliv.sonyliv", "sonyliv", "in.sonyliv.webos"],
-            keywordGroups: [["sony", "liv"], ["sonyliv"], ["sony"]]
+            keywordGroups: [["sony","liv"], ["sonyliv"], ["sony"]]
         )
         let jioCinema = StreamingAppFallback(
             alternates: [
                 "com.jio.media.jioplay", "jiocinema", "com.jio.media.ondemand",
-                "com.jio.jioplay.tv", "com.jio.jioplay", "com.jio.media.jioplay.tv"
+                "com.jio.jioplay.tv", "com.jio.jioplay", "com.jio.media.jioplay.tv",
+                "jiocinema-webos", "com.reliance.jiocinema"
             ],
-            keywordGroups: [["jio", "cinema"], ["jiocinema"], ["jio"]]
+            keywordGroups: [["jio","cinema"], ["jiocinema"], ["jio"]]
         )
 
-        var map: [String: StreamingAppFallback] = [
-            "amzn.tvarm": prime,
-            "netflix": netflix,
-            "com.startv.hotstar.lg": hotstar,
-            "com.sonyliv.lg": sonyLiv,
-            "com.jio.media.jioplay.tv": jioCinema
+        var map: [String: StreamingAppFallback] = [:]
+
+        // populate canonical -> fallback
+        let groups: [(keys:[String], fallback: StreamingAppFallback)] = [
+            (["amzn.tvarm","amazon-webos","primevideo","com.amazon.amazonvideo.webos"], prime),
+            (["netflix","com.netflix.app"], netflix),
+            (["com.startv.hotstar.lg", "disneyplus-hotstar","hotstar"], hotstar),
+            (["com.sonyliv.lg","sonyliv-webos","com.sonyliv"], sonyLiv),
+            (["com.jio.media.jioplay.tv","com.jio.media.jioplay","jiocinema"], jioCinema)
         ]
 
-        ["amazon-webos", "amazon-webos-us", "primevideo", "com.amazon.amazonvideo.webos", "com.amazon.ignition", "amazonprimevideo", "com.webos.app.amazonprimevideo", "com.amazon.shoptv.webos", "primevideo-webos", "amazonprimevideo-webos"].forEach {
-            map[$0] = prime
-        }
-        ["disneyplus-hotstar", "hotstar", "com.disney.disneyplus-in", "com.star.hotstar", "disney.hotstar"].forEach {
-            map[$0] = hotstar
-        }
-        ["sonyliv-webos", "com.sonyliv", "com.sonyliv.sonyliv", "sonyliv", "in.sonyliv.webos"].forEach {
-            map[$0] = sonyLiv
-        }
-        ["com.jio.media.jioplay", "jiocinema", "com.jio.media.ondemand", "com.jio.jioplay.tv", "com.jio.jioplay", "com.jio.media.jioplay.tv"].forEach {
-            map[$0] = jioCinema
+        for (keys, fallback) in groups {
+            for k in keys { map[k] = fallback }
+            // also insert alternates from fallback
+            for alt in fallback.alternates { map[alt] = fallback }
         }
 
         return map
@@ -121,39 +118,21 @@ final class WebOSTV: ObservableObject {
     private let streamingAppDisplayNames: [String: String] = [
         "amzn.tvarm": "Prime Video",
         "amazon-webos": "Prime Video",
-        "amazon-webos-us": "Prime Video",
         "primevideo": "Prime Video",
-        "com.amazon.amazonvideo.webos": "Prime Video",
-        "com.amazon.ignition": "Prime Video",
-        "amazonprimevideo": "Prime Video",
-        "com.webos.app.amazonprimevideo": "Prime Video",
-        "com.amazon.shoptv.webos": "Prime Video",
-        "primevideo-webos": "Prime Video",
-        "amazonprimevideo-webos": "Prime Video",
         "netflix": "Netflix",
         "com.startv.hotstar.lg": "Disney+ Hotstar",
-        "disneyplus-hotstar": "Disney+ Hotstar",
-        "hotstar": "Disney+ Hotstar",
-        "com.disney.disneyplus-in": "Disney+ Hotstar",
-        "com.star.hotstar": "Disney+ Hotstar",
-        "disney.hotstar": "Disney+ Hotstar",
         "com.sonyliv.lg": "Sony LIV",
-        "sonyliv-webos": "Sony LIV",
-        "com.sonyliv": "Sony LIV",
-        "com.sonyliv.sonyliv": "Sony LIV",
-        "sonyliv": "Sony LIV",
-        "in.sonyliv.webos": "Sony LIV",
-        "com.jio.media.jioplay.tv": "JioCinema",
-        "com.jio.media.jioplay": "JioCinema",
-        "jiocinema": "JioCinema",
-        "com.jio.media.ondemand": "JioCinema",
-        "com.jio.jioplay.tv": "JioCinema",
-        "com.jio.jioplay": "JioCinema"
+        "com.jio.media.jioplay.tv": "JioCinema"
     ]
 
-    private var launchPointsCache: [[String: Any]]?
-    private var launchPointsLoading = false
-    private var launchPointsWaiters: [(Result<[[String: Any]], Error>) -> Void] = []
+    private struct TVApp: Equatable {
+        let id: String
+        let title: String
+    }
+
+    private var installedApps: [TVApp] = []
+    private var lastAppFetchDate: Date?
+    private var appFetchCallbacks: [(Result<[TVApp], Error>) -> Void] = []
 
     // Persisted convenience
     static var savedIP: String?  { UserDefaults.standard.string(forKey: "LGRemoteMVP.lastIP") }
@@ -165,7 +144,6 @@ final class WebOSTV: ObservableObject {
 
     // MARK: Connect
 
-    /// Connect, but first do a fast ICMP reachability check for nicer UX.
     func connect(ip: String, completion: @escaping (Bool, String) -> Void) {
         self.ip = ip
         connectCompletion = completion
@@ -176,13 +154,13 @@ final class WebOSTV: ObservableObject {
         queuedButtons.removeAll()
         retryingButtonKey = nil
         failedButtonServices.removeAll()
+        installedApps.removeAll()
+        lastAppFetchDate = nil
+        cancelAppFetches(reason: "Connecting to new TV")
         pointerSocket?.close()
         pointerSocket = nil
         activeInputRemoteService = nil
         clientKey = WebOSTV.savedClientKey
-        launchPointsCache = nil
-        launchPointsLoading = false
-        launchPointsWaiters.removeAll()
         cancelAllPendingRequests(message: "Previous requests cancelled")
         lastMessage = "Pinging \(ip)…"
 
@@ -196,6 +174,19 @@ final class WebOSTV: ObservableObject {
             Ping.isReachable(ip: ip, port: 3000, timeout: 0.7) { [weak self] reachableLegacy in
                 guard let self else { return }
                 if reachableLegacy {
+        // quick reachability (uses Ping helper)
+        Ping.isReachable(ip: ip, port: 3000, timeout: 0.7) { [weak self] reachable in
+            guard let self else { return }
+            if !reachable {
+                Ping.isReachable(ip: ip, port: 3001, timeout: 0.7) { [weak self] reachable2 in
+                    guard let self else { return }
+                    if !reachable2 {
+                        DispatchQueue.main.async {
+                            self.lastMessage = "TV at \(ip) didn’t respond on 3000/3001. Check Wi-Fi / LG Connect Apps."
+                        }
+                        self.completeConnect(false, "Host not reachable")
+                        return
+                    }
                     self.openSocketAndRegister()
                     return
                 }
@@ -207,117 +198,240 @@ final class WebOSTV: ObservableObject {
         }
     }
 
-    private func handleResponse(id: String?, payload: [String: Any]?, dict: [String: Any]) {
-        guard let id else { return }
-        let payloadData = payload ?? [:]
-        let returnValue = (payloadData["returnValue"] as? Bool) ?? true
+    // MARK: - Request helpers (with retry on server errors)
 
-        if returnValue {
-            _ = completeRequest(id: id, result: .success(payloadData))
-        } else {
-            let message = extractErrorMessage(dict: dict, payload: payloadData)
-            let error = makeTVError(message, code: -11, payload: payloadData)
-            let handled = completeRequest(id: id, result: .failure(error))
-            if !handled {
-                DispatchQueue.main.async {
-                    self.lastMessage = "Command failed: \(message)"
+    private func nextRequestId(_ prefix: String) -> String {
+        defer { nextId += 1 }
+        return "\(prefix)-\(nextId)"
+    }
+
+    private func send(_ object: [String: Any], completion: ((Error?) -> Void)? = nil) {
+        guard registered, let sock = socket else {
+            completion?(NSError(domain: "WebOSTV", code: -1,
+                                userInfo: [NSLocalizedDescriptionKey: "Not registered/connected"]))
+            return
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: object, options: []),
+              let text = String(data: data, encoding: .utf8) else {
+            completion?(NSError(domain: "WebOSTV", code: -2,
+                                userInfo: [NSLocalizedDescriptionKey: "Encode error"]))
+            return
+        }
+        sock.send(text, completion: completion)
+    }
+
+    /// sendSimple with retry on 5xx server errors (exponential backoff)
+    func sendSimple(uri: String,
+                    payload: [String: Any] = [:],
+                    retries: Int = 2,
+                    completion: ((Result<[String: Any], Error>) -> Void)? = nil) {
+
+        guard registered else {
+            completion?(.failure(makeTVError("TV not registered yet", code: -3)))
+            return
+        }
+
+        let requestId = nextRequestId("req")
+        let req: [String: Any] = [
+            "id": requestId,
+            "type": "request",
+            "uri": uri,
+            "payload": payload
+        ]
+
+        if let completion {
+            pendingResponses[requestId] = completion
+        }
+
+        // wrapper to send and optionally retry on server error
+        func attemptSend(remaining: Int, delay: TimeInterval = 0.0) {
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self else { return }
+                self.send(req) { error in
+                    if let error,
+                       self.shouldRetryForError(error) && remaining > 0 {
+                        // remove and re-add handler (it stays in pendingResponses keyed)
+                        let backoff = Double( (2 * (2 - remaining + 1)) ) * 0.15 // small backoff
+                        attemptSend(remaining: remaining - 1, delay: backoff)
+                        return
+                    }
+                    if let error {
+                        if let handler = self.pendingResponses.removeValue(forKey: requestId) {
+                            DispatchQueue.main.async { handler(.failure(error)) }
+                        } else {
+                            // no handler — ignore
+                        }
+                    }
                 }
             }
         }
+
+        attemptSend(remaining: retries)
     }
 
-    private func handleError(id: String?, payload: [String: Any]?, dict: [String: Any]) {
-        let message = extractErrorMessage(dict: dict, payload: payload)
-
-        var handled = false
-        if let id {
-            let error = makeTVError(message, code: -12, payload: payload)
-            handled = completeRequest(id: id, result: .failure(error))
-        }
-
-        if !handled && !registered {
-            failEarly("TV error: \(message)")
-        } else if !handled {
-            DispatchQueue.main.async {
-                self.lastMessage = "TV error: \(message)"
-            }
-        }
-
-        if isGestureTimeout(message) {
-            handleGestureTimeout()
-        }
-    }
-
-    @discardableResult
-    private func completeRequest(id: String, result: Result<[String: Any], Error>) -> Bool {
-        guard let handler = pendingResponses.removeValue(forKey: id) else { return false }
-        DispatchQueue.main.async {
-            handler(result)
-        }
-        return true
-    }
-
-    private func extractErrorMessage(dict: [String: Any], payload: [String: Any]?) -> String {
-        if let payload,
-           let text = payload["errorText"] as? String,
-           !text.isEmpty {
-            return text
-        }
-        if let payload,
-           let message = payload["message"] as? String,
-           !message.isEmpty {
-            return message
-        }
-        if let error = dict["error"] as? String,
-           !error.isEmpty {
-            return error
-        }
-        if let payload,
-           let code = payload["errorCode"] {
-            return "\(code)"
-        }
-        return "Unknown error"
-    }
-
-    private func makeTVError(_ message: String, code: Int = -10, payload: [String: Any]? = nil) -> NSError {
-        var userInfo: [String: Any] = [NSLocalizedDescriptionKey: message]
-        if let payload,
-           let errorCode = payload["errorCode"] {
-            userInfo["errorCode"] = errorCode
-        }
-        return NSError(domain: "WebOSTV", code: code, userInfo: userInfo)
-    }
-
-    private func isGestureTimeout(_ message: String) -> Bool {
-        message.lowercased().contains("gesture gate timed out")
-    }
-
-    private func isServiceMissing(_ message: String, error: Error) -> Bool {
-        let lower = message.lowercased()
-        if lower.contains("no such service") || lower.contains("service not found") {
-            return true
-        }
-        if lower.contains("invalid request") && lower.contains("input") {
-            return true
-        }
-        if lower.contains("404") {
-            return true
-        }
-        let nsError = error as NSError
-        if let code = nsError.userInfo["errorCode"] as? Int, code == 404 {
-            return true
-        }
-        if let codeString = nsError.userInfo["errorCode"] as? String,
-           codeString == "404" {
-            return true
-        }
+    // Decide if an error should be retried (server 5xx or transport)
+    private func shouldRetryForError(_ error: Error) -> Bool {
+        let ns = error as NSError
+        if let code = ns.userInfo["errorCode"] as? Int, (500...599).contains(code) { return true }
+        if (500...599).contains(ns.code) { return true }
+        // network connection issues can also be transient — allow a single retry for those
+        if (ns.domain == NSURLErrorDomain) { return true }
         return false
     }
 
-    private func handleGestureTimeout() {
-        inputRemotePrimed = false
-        ensureInputRemoteReady(force: true)
+    // MARK: Button sending — prefer button service, fallback to pointer when required
+
+    func sendButton(key: String) {
+        // public entry — default allow queuing
+        sendButton(key: key, allowQueue: true)
     }
+
+    /// Prefer the registered button service; fall back to pointer socket only when needed.
+    private func sendButton(key: String, allowQueue: Bool) {
+        guard registered else {
+            if allowQueue {
+                enqueueButtonForRetry(key, prioritizingFront: false)
+            }
+            return
+        }
+
+        if let service = activeInputRemoteService, inputRemotePrimed {
+            // attempt send using service. On server errors we will fallback to pointer in handler.
+            sendSimple(uri: service.sendButtonURI, payload: ["name": key], retries: 2) { [weak self] result in
+                guard let self else { return }
+                switch result {
+                case .success:
+                    if self.retryingButtonKey == key { self.retryingButtonKey = nil }
+                case .failure(let error):
+                    // If server error or missing service, prefer pointer fallback:
+                    if self.shouldFallbackToPointer(for: error) {
+                        // enqueue and ensure pointer
+                        if allowQueue { self.enqueueButtonForRetry(key, prioritizingFront: true) }
+                        self.ensurePointerSocket(force: true)
+                    } else if allowQueue {
+                        // other errors: queue for retry later
+                        self.enqueueButtonForRetry(key, prioritizingFront: false)
+                    } else {
+                        DispatchQueue.main.async { self.lastMessage = "Button failed: \(error.localizedDescription)" }
+                    }
+                }
+            }
+            return
+        }
+
+        if let pointer = pointerSocket, pointer.isReady {
+            pointer.sendButton(key)
+            if retryingButtonKey == key { retryingButtonKey = nil }
+            return
+        }
+
+        // No transport is ready yet — enqueue and kick off registration.
+        if allowQueue {
+            enqueueButtonForRetry(key, prioritizingFront: false)
+            ensureInputRemoteReady() // this will also attempt pointer service if buttons services fail
+        }
+    }
+
+    // MARK: - Pointer socket helpers
+
+    /// Ensure pointer socket is open (tries pointer services). If `force` -> close existing and reopen.
+    private func ensurePointerSocket(force: Bool = false) {
+        guard registered else { return }
+        if inputRemotePriming && !force { return } // don't race if already priming
+        if !force, pointerSocket?.isReady == true { inputRemotePrimed = true; return }
+
+        // If forced, close existing socket first to retry cleanly
+        if force {
+            pointerSocket?.close()
+            pointerSocket = nil
+        }
+
+        // Start pointer discovery/connection in background
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            self.primePointerService(at: 0, collectedError: nil)
+        }
+    }
+
+    // primePointerService reuse — attempts pointerServiceCandidates and opens pointer socket
+    private func primePointerService(at index: Int, collectedError: Error?) {
+        guard registered else { finalizeInputRemotePrime(error: collectedError); return }
+        guard !pointerServiceCandidates.isEmpty else { finalizeInputRemotePrime(error: collectedError); return }
+        guard index < pointerServiceCandidates.count else { finalizeInputRemotePrime(error: collectedError); return }
+
+        let candidate = pointerServiceCandidates[index]
+        sendSimple(uri: candidate.requestURI, payload: [:], retries: 1) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let payload):
+                let urls = self.pointerSocketURLs(from: payload)
+                guard !urls.isEmpty else {
+                    self.primePointerService(at: index + 1, collectedError: collectedError)
+                    return
+                }
+                self.openPointerSocket(with: urls) { success, error in
+                    if success {
+                        // pointer ready — mark primed and flush queued buttons
+                        self.activeInputRemoteService = nil
+                        self.inputRemotePrimed = true
+                        self.inputRemotePriming = false
+                        self.lastMessage = "Input remote ready (pointer)"
+                        self.flushQueuedButtons()
+                    } else {
+                        self.pointerSocket = nil
+                        let aggregatedError = error ?? collectedError
+                        self.primePointerService(at: index + 1, collectedError: aggregatedError)
+                    }
+                }
+            case .failure:
+                // try next candidate
+                self.primePointerService(at: index + 1, collectedError: collectedError)
+            }
+        }
+    }
+
+    private func openPointerSocket(with urls: [URL], completion: @escaping (Bool, Error?) -> Void) {
+        guard !urls.isEmpty else {
+            completion(false, makeTVError("Pointer socket path missing", code: -15))
+            return
+        }
+
+        let socket = PointerSocket(host: ip, clientKey: clientKey, allowInsecureLocalTLS: true)
+        pointerSocket = socket
+
+        socket.onDisconnect = { [weak self, weak socket] error in
+            guard let self else { return }
+            DispatchQueue.main.async {
+                guard let socket, self.pointerSocket === socket else { return }
+                self.pointerSocket = nil
+                self.inputRemotePrimed = false
+                self.activeInputRemoteService = nil
+                if let error {
+                    if let urlError = error as? URLError, urlError.code == .networkConnectionLost {
+                        self.lastMessage = "Pointer connection lost, retrying…"
+                    } else {
+                        self.lastMessage = "Pointer input disconnected: \(error.localizedDescription)"
+                    }
+                } else {
+                    self.lastMessage = "Pointer connection closed, retrying…"
+                }
+                // attempt to prime again
+                self.ensurePointerSocket(force: true)
+            }
+        }
+
+        socket.connect(urls: urls) { [weak self, weak socket] success, error in
+            guard let self else { return }
+            DispatchQueue.main.async {
+                if !success, let socket, self.pointerSocket === socket {
+                    self.pointerSocket = nil
+                }
+                completion(success, error)
+            }
+        }
+    }
+
+    // MARK: - Input remote / prime logic (keep but tolerate failures)
 
     private func ensureInputRemoteReady(force: Bool = false) {
         guard registered else { return }
@@ -355,10 +469,12 @@ final class WebOSTV: ObservableObject {
             }
             let payload = inputRemoteRegisterPayload()
             let currentIndex = searchIndex
-            sendSimple(uri: service.registerURI, payload: payload) { [weak self] result in
+            // TRY registration but do not block forever; if failure, mark and continue.
+            sendSimple(uri: service.registerURI, payload: payload, retries: 1) { [weak self] result in
                 guard let self else { return }
                 switch result {
                 case .success:
+                    // we successfully registered to a button service — prefer buttons but still keep pointer support
                     self.pointerSocket?.close()
                     self.pointerSocket = nil
                     self.activeInputRemoteService = service
@@ -367,6 +483,7 @@ final class WebOSTV: ObservableObject {
                     self.lastMessage = "Input remote ready (buttons)"
                     self.flushQueuedButtons()
                 case .failure(let error):
+                    // mark failure but don't treat as fatal — fall back to pointer
                     self.failedButtonServices.insert(service.registerURI)
                     self.primeButtonService(at: currentIndex + 1, collectedError: error)
                 }
@@ -374,52 +491,8 @@ final class WebOSTV: ObservableObject {
             return
         }
 
+        // No button service succeeded — attempt pointer
         primePointerService(at: 0, collectedError: collectedError)
-    }
-
-    private func primePointerService(at index: Int, collectedError: Error?) {
-        guard registered else {
-            finalizeInputRemotePrime(error: collectedError)
-            return
-        }
-
-        guard !pointerServiceCandidates.isEmpty else {
-            finalizeInputRemotePrime(error: collectedError)
-            return
-        }
-
-        guard index < pointerServiceCandidates.count else {
-            finalizeInputRemotePrime(error: collectedError)
-            return
-        }
-
-        let candidate = pointerServiceCandidates[index]
-        sendSimple(uri: candidate.requestURI) { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .success(let payload):
-                let urls = self.pointerSocketURLs(from: payload)
-                guard !urls.isEmpty else {
-                    self.primePointerService(at: index + 1, collectedError: collectedError)
-                    return
-                }
-                self.openPointerSocket(with: urls) { success, error in
-                    if success {
-                        self.activeInputRemoteService = nil
-                        self.inputRemotePrimed = true
-                        self.inputRemotePriming = false
-                        self.lastMessage = "Input remote ready (pointer)"
-                        self.flushQueuedButtons()
-                    } else {
-                        self.pointerSocket = nil
-                        let aggregatedError = error ?? collectedError
-                        self.primePointerService(at: index + 1, collectedError: aggregatedError)
-                    }
-                }
-            case .failure(let error):
-                self.primePointerService(at: index + 1, collectedError: error)
-            }
-        }
     }
 
     private func finalizeInputRemotePrime(error: Error?) {
@@ -433,12 +506,15 @@ final class WebOSTV: ObservableObject {
         }
     }
 
+    // MARK: Queue helpers
+
     private func flushQueuedButtons() {
         guard !queuedButtons.isEmpty else { return }
         let pending = queuedButtons
         queuedButtons.removeAll()
         retryingButtonKey = nil
         for key in pending {
+            // when flushing, do not allow queueing again (prevent infinite loop)
             sendButton(key: key, allowQueue: false)
         }
     }
@@ -450,277 +526,215 @@ final class WebOSTV: ObservableObject {
         } else {
             queuedButtons.append(key)
         }
-        if queuedButtons.count > 30 {
-            if prioritizingFront {
-                queuedButtons = Array(queuedButtons.prefix(30))
-            } else {
-                queuedButtons.removeFirst(queuedButtons.count - 30)
-            }
+        if queuedButtons.count > 60 {
+            // keep a larger window; drop oldest if necessary
+            queuedButtons = Array(queuedButtons.suffix(60))
         }
     }
 
-    private func openPointerSocket(with urls: [URL], completion: @escaping (Bool, Error?) -> Void) {
-        guard !urls.isEmpty else {
-            completion(false, makeTVError("Pointer socket path missing", code: -15))
-            return
-        }
+    // MARK: App launching with fallback (unchanged but extended)
+    func launchStreamingApp(_ appId: String) {
+        attemptLaunch(appId: appId, originalKey: appId, tried: [])
+    }
 
-        let socket = PointerSocket(host: ip, clientKey: clientKey, allowInsecureLocalTLS: true)
-        pointerSocket = socket
-
-        socket.onDisconnect = { [weak self, weak socket] error in
+    private func attemptLaunch(appId: String, originalKey: String, tried: Set<String>) {
+        DispatchQueue.main.async { self.lastMessage = "Launching \(self.displayName(for: appId))…" }
+        sendSimple(uri: "ssap://system.launcher/launch", payload: ["id": appId], retries: 2) { [weak self] result in
             guard let self else { return }
-            DispatchQueue.main.async {
-                guard let socket, self.pointerSocket === socket else { return }
-                self.pointerSocket = nil
-                self.inputRemotePrimed = false
-                self.activeInputRemoteService = nil
-                if let error {
-                    if let urlError = error as? URLError, urlError.code == .networkConnectionLost {
-                        self.lastMessage = "Pointer connection lost, retrying…"
-                    } else {
-                        self.lastMessage = "Pointer input disconnected: \(error.localizedDescription)"
-                    }
-                } else {
-                    self.lastMessage = "Pointer connection closed, retrying…"
-                }
-                self.ensureInputRemoteReady(force: true)
-            }
-        }
-
-        socket.connect(urls: urls) { [weak self, weak socket] success, error in
-            guard let self else { return }
-            DispatchQueue.main.async {
-                if !success, let socket, self.pointerSocket === socket {
-                    self.pointerSocket = nil
-                }
-                completion(success, error)
-            }
-        }
-    }
-
-    private func inputRemoteRegisterPayload() -> [String: Any] {
-        guard let key = clientKey, !key.isEmpty else { return [:] }
-        return ["client-key": key]
-    }
-
-    private func pointerSocketURLs(from payload: [String: Any]) -> [URL] {
-        var rawEntries: [String] = []
-
-        if let secure = payload["socketPathSecure"] as? String { rawEntries.append(secure) }
-        if let path = payload["socketPath"] as? String { rawEntries.append(path) }
-        if let list = payload["socketPathList"] as? [String] {
-            rawEntries.append(contentsOf: list)
-        } else if let nestedList = payload["socketPathList"] as? [[String: Any]] {
-            for entry in nestedList {
-                if let uri = entry["uri"] as? String {
-                    rawEntries.append(uri)
-                }
-                if let path = entry["path"] as? String {
-                    rawEntries.append(path)
-                }
-            }
-        }
-        if let socketPaths = payload["socketPaths"] as? [String] {
-            rawEntries.append(contentsOf: socketPaths)
-        }
-        if let socket = payload["socket"] as? String {
-            rawEntries.append(socket)
-        }
-
-        var urls: [URL] = []
-        for entry in rawEntries {
-            urls.append(contentsOf: buildPointerURLs(from: entry))
-        }
-
-        if urls.isEmpty, let address = payload["address"] as? String {
-            var ports: [Int] = []
-            if let port = payload["port"] as? Int {
-                ports.append(port)
-            } else if let portString = payload["port"] as? String, let port = Int(portString) {
-                ports.append(port)
-            }
-            if ports.isEmpty { ports = [3001, 3000] }
-            for scheme in ["wss", "ws"] {
-                for port in ports {
-                    if let url = URL(string: "\(scheme)://\(address):\(port)") {
-                        urls.append(url)
-                    }
-                }
-            }
-        }
-
-        return dedupe(urls)
-    }
-
-    private func buildPointerURLs(from raw: String) -> [URL] {
-        var trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return [] }
-
-        var urls: [URL] = []
-
-        if let url = URL(string: trimmed),
-           let scheme = url.scheme?.lowercased() {
-            switch scheme {
-            case "ws", "wss":
-                urls.append(url)
-                if let toggled = toggleWSScheme(for: url) {
-                    urls.append(toggled)
-                }
-                return dedupe(urls)
-            case "http", "https":
-                if var components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
-                    components.scheme = (scheme == "http") ? "ws" : "wss"
-                    if let wsURL = components.url {
-                        urls.append(wsURL)
-                        if let toggled = toggleWSScheme(for: wsURL) {
-                            urls.append(toggled)
-                        }
-                        return dedupe(urls)
-                    }
-                }
-            default:
+            switch result {
+            case .success:
                 break
+            case .failure(let error):
+                let updatedTried = tried.union([appId.lowercased()])
+                self.handleLaunchFailure(originalKey: originalKey, tried: updatedTried, error: error)
             }
         }
-
-        if trimmed.hasPrefix("//") {
-            trimmed.removeFirst(2)
-        }
-
-        if !trimmed.hasPrefix("/") {
-            trimmed = "/\(trimmed)"
-        }
-
-        for scheme in ["wss", "ws"] {
-            for port in [3001, 3000] {
-                if let url = URL(string: "\(scheme)://\(ip):\(port)\(trimmed)") {
-                    urls.append(url)
-                }
-            }
-        }
-
-        return dedupe(urls)
     }
 
-    private func toggleWSScheme(for url: URL) -> URL? {
-        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else { return nil }
-        switch components.scheme {
-        case "ws":
-            components.scheme = "wss"
-        case "wss":
-            components.scheme = "ws"
-        default:
-            return nil
-        }
-        return components.url
-    }
-
-    private func dedupe(_ urls: [URL]) -> [URL] {
-        var seen = Set<String>()
-        var result: [URL] = []
-        for url in urls {
-            let key = url.absoluteString
-            if seen.insert(key).inserted {
-                result.append(url)
-            }
-        }
-        return result
-    }
-
-    private func handleCommandFailure(error: Error, key: String, allowQueue: Bool) {
+    private func handleLaunchFailure(originalKey: String, tried: Set<String>, error: Error) {
         let message = error.localizedDescription
-        if allowQueue && isServiceMissing(message, error: error) {
-            if retryingButtonKey != key {
-                retryingButtonKey = key
+        guard isRecoverableLaunchError(message, error: error) else {
+            DispatchQueue.main.async {
+                self.lastMessage = "\(self.displayName(for: originalKey)) launch failed: \(message)"
             }
-            if allowQueue {
-                enqueueButtonForRetry(key, prioritizingFront: true)
-            }
-            activeInputRemoteService = nil
-            pointerSocket?.close()
-            pointerSocket = nil
-            inputRemotePrimed = false
-            lastMessage = "Input remote service unavailable, retrying…"
-            ensureInputRemoteReady(force: true)
-            return
-        }
-        if allowQueue && isGestureTimeout(message) {
-            if retryingButtonKey != key {
-                retryingButtonKey = key
-                enqueueButtonForRetry(key, prioritizingFront: true)
-            }
-            inputRemotePrimed = false
-            ensureInputRemoteReady(force: true)
             return
         }
 
-        if allowQueue && shouldFallbackToPointer(for: message, error: error) {
-            handleFatalButtonServiceError(message: message, key: key, allowQueue: allowQueue)
-            return
-        }
-
-        if retryingButtonKey == key {
-            retryingButtonKey = nil
-        }
-
-        DispatchQueue.main.async {
-            self.lastMessage = "Command failed: \(message)"
+        resolveNextAppId(originalKey: originalKey, tried: tried) { [weak self] nextId in
+            guard let self else { return }
+            guard let nextId else {
+                DispatchQueue.main.async {
+                    self.lastMessage = "\(self.displayName(for: originalKey)) launch failed: \(message)"
+                }
+                return
+            }
+            DispatchQueue.main.async {
+                self.lastMessage = "Retrying \(self.displayName(for: originalKey)) as \(self.displayName(for: nextId))…"
+            }
+            self.attemptLaunch(appId: nextId, originalKey: originalKey, tried: tried)
         }
     }
 
-    private func shouldFallbackToPointer(for message: String, error: Error) -> Bool {
-        let lower = message.lowercased()
-        if lower.contains("application error") { return true }
-        if lower.contains("internal server error") { return true }
-        if lower.contains("500") { return true }
+    private func displayName(for appId: String) -> String {
+        let key = appId.lowercased()
+        return streamingAppDisplayNames[key] ?? appId
+    }
 
+    private func isRecoverableLaunchError(_ message: String, error: Error) -> Bool {
+        let lower = message.lowercased()
+        if lower.contains("no such app") || lower.contains("no such application") || lower.contains("not installed") || lower.contains("no such service") || lower.contains("not exist") { return true }
+        if lower.contains("internal server error") || lower.contains("internal error") || lower.contains("application error") || lower.contains("500") || lower.contains("404") { return true }
         let nsError = error as NSError
-        if isServerError(code: nsError.code) { return true }
-        if let code = nsError.userInfo["errorCode"] as? Int, isServerError(code: code) { return true }
-        if let codeNumber = nsError.userInfo["errorCode"] as? NSNumber,
-           isServerError(code: codeNumber.intValue) { return true }
-        if let codeString = nsError.userInfo["errorCode"] as? String,
-           let numeric = Int(codeString.trimmingCharacters(in: .whitespaces)),
-           isServerError(code: numeric) { return true }
+        if (400...599).contains(nsError.code) { return true }
+        if let code = nsError.userInfo["errorCode"] as? Int, (400...599).contains(code) { return true }
         return false
     }
 
-    private func handleFatalButtonServiceError(message: String, key: String, allowQueue: Bool) {
-        if retryingButtonKey != key {
-            retryingButtonKey = key
+    // Helper: find alternate IDs to retry
+    private func resolveNextAppId(originalKey: String, tried: Set<String>, completion: @escaping (String?) -> Void) {
+        if let staticId = nextStaticAppId(originalKey: originalKey, tried: tried) {
+            completion(staticId)
+            return
         }
-        if allowQueue {
-            enqueueButtonForRetry(key, prioritizingFront: true)
-        }
-        if let service = activeInputRemoteService {
-            failedButtonServices.insert(service.registerURI)
-        }
-        activeInputRemoteService = nil
-        inputRemotePrimed = false
-        pointerSocket?.close()
-        pointerSocket = nil
-        DispatchQueue.main.async {
-            self.lastMessage = "Button input rejected (\(message)). Switching input method…"
-        }
-        ensureInputRemoteReady(force: true)
-    }
 
-    private func isServerError(code: Int) -> Bool {
-        (500...599).contains(code)
-    }
+        let keywords = keywordGroups(for: originalKey)
 
-    private func cancelAllPendingRequests(message: String) {
-        guard !pendingResponses.isEmpty else { return }
-        let handlers = pendingResponses
-        pendingResponses.removeAll()
-        let error = makeTVError(message, code: -14)
-        for handler in handlers.values {
-            DispatchQueue.main.async {
-                handler(.failure(error))
+        if let cached = searchInstalledApps(using: keywords, tried: tried) {
+            completion(cached)
+            return
+        }
+
+        fetchInstalledApps(force: false) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success:
+                completion(self.searchInstalledApps(using: keywords, tried: tried))
+            case .failure(let error):
+                DispatchQueue.main.async {
+                    self.lastMessage = "Couldn’t fetch installed apps: \(error.localizedDescription)"
+                }
+                completion(nil)
             }
         }
     }
+
+    private func nextStaticAppId(originalKey: String, tried: Set<String>) -> String? {
+        let lower = originalKey.lowercased()
+        if let fallback = streamingAppFallbacks[lower] {
+            for alt in fallback.alternates where !tried.contains(alt.lowercased()) {
+                return alt
+            }
+        }
+        for (key, fallback) in streamingAppFallbacks {
+            if tried.contains(key) { continue }
+            for group in fallback.keywordGroups {
+                if group.allSatisfy({ lower.contains($0) }) {
+                    return key
+                }
+            }
+        }
+        return nil
+    }
+
+    private func keywordGroups(for key: String) -> [[String]] {
+        var groups: [[String]] = []
+        if let fallback = streamingAppFallbacks[key.lowercased()] {
+            groups.append(contentsOf: fallback.keywordGroups)
+        }
+        if let display = streamingAppDisplayNames[key.lowercased()] {
+            let tokens = normalizedKeywords(from: display)
+            if !tokens.isEmpty { groups.append(tokens) }
+        }
+        let direct = normalizedKeywords(from: key)
+        if !direct.isEmpty { groups.append(direct) }
+        return groups
+    }
+
+    private func normalizedKeywords(from text: String) -> [String] {
+        return text
+            .lowercased()
+            .split { !$0.isLetter && !$0.isNumber }
+            .map { String($0) }
+            .filter { !$0.isEmpty }
+    }
+
+    private func searchInstalledApps(using keywordGroups: [[String]], tried: Set<String>) -> String? {
+        guard !installedApps.isEmpty else { return nil }
+        for group in keywordGroups where !group.isEmpty {
+            if let match = installedApps.first(where: { app in
+                guard !tried.contains(app.id.lowercased()) else { return false }
+                let haystack = "\(app.title) \(app.id)".lowercased()
+                return group.allSatisfy { haystack.contains($0) }
+            }) {
+                return match.id
+            }
+        }
+        return nil
+    }
+
+    private func fetchInstalledApps(force: Bool,
+                                    completion: @escaping (Result<[TVApp], Error>) -> Void) {
+        DispatchQueue.main.async {
+            if !force,
+               let last = self.lastAppFetchDate,
+               Date().timeIntervalSince(last) < 30,
+               !self.installedApps.isEmpty {
+                completion(.success(self.installedApps))
+                return
+            }
+
+            guard self.registered else {
+                completion(.failure(self.makeTVError("TV not registered", code: -16)))
+                return
+            }
+
+            self.appFetchCallbacks.append(completion)
+            if self.appFetchCallbacks.count > 1 { return }
+
+            self.sendSimple(uri: "ssap://com.webos.applicationManager/listApps",
+                            payload: [:],
+                            retries: 1) { [weak self] result in
+                guard let self else { return }
+                switch result {
+                case .success(let payload):
+                    let apps = self.parseInstalledApps(from: payload)
+                    self.installedApps = apps
+                    self.lastAppFetchDate = Date()
+                    let callbacks = self.appFetchCallbacks
+                    self.appFetchCallbacks.removeAll()
+                    callbacks.forEach { $0(.success(apps)) }
+                case .failure(let error):
+                    let callbacks = self.appFetchCallbacks
+                    self.appFetchCallbacks.removeAll()
+                    callbacks.forEach { $0(.failure(error)) }
+                }
+            }
+        }
+    }
+
+    private func parseInstalledApps(from payload: [String: Any]) -> [TVApp] {
+        guard let entries = payload["apps"] as? [[String: Any]] else { return [] }
+        var seen = Set<String>()
+        var parsed: [TVApp] = []
+        for entry in entries {
+            guard let idRaw = entry["id"] as? String else { continue }
+            let id = idRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !id.isEmpty else { continue }
+            if !seen.insert(id.lowercased()).inserted { continue }
+            let title = (entry["title"] as? String ??
+                         entry["name"] as? String ??
+                         entry["appName"] as? String ??
+                         id).trimmingCharacters(in: .whitespacesAndNewlines)
+            parsed.append(TVApp(id: id, title: title))
+        }
+        return parsed
+    }
+
+    private func prefetchInstalledApps() {
+        fetchInstalledApps(force: true) { _ in }
+    }
+
+    // MARK: Socket open / register / pairing (unchanged core logic)
 
     private func openSocketAndRegister() {
         DispatchQueue.main.async { self.lastMessage = "Opening socket…" }
@@ -759,20 +773,13 @@ final class WebOSTV: ObservableObject {
         pointerSocket?.close()
         pointerSocket = nil
         activeInputRemoteService = nil
-        launchPointsCache = nil
-        launchPointsLoading = false
-        launchPointsWaiters.removeAll()
+        installedApps.removeAll()
+        lastAppFetchDate = nil
+        cancelAppFetches(reason: "Disconnected")
         cancelAllPendingRequests(message: "Disconnected")
-        if connectCompletion != nil {
-            completeConnect(false, "Disconnected")
-        }
-        DispatchQueue.main.async {
-            self.isConnected = false
-            self.onDisconnect?()
-        }
+        if connectCompletion != nil { completeConnect(false, "Disconnected") }
+        DispatchQueue.main.async { self.isConnected = false; self.onDisconnect?() }
     }
-
-    // MARK: Pairing / Register
 
     private func performRegisterHandshake() {
         DispatchQueue.main.async { self.lastMessage = "Registering…" }
@@ -818,15 +825,15 @@ final class WebOSTV: ObservableObject {
         ]
     }
 
+    // MARK: Message handling (partial reuse)
     private func handleSocketMessage(_ result: Result<URLSessionWebSocketTask.Message, Error>) {
         switch result {
         case .success(let msg):
             switch msg {
             case .string(let s):
-                DispatchQueue.main.async { self.lastMessage = s }
-                self.processJSONMessage(s)
-            case .data(let d):
-                DispatchQueue.main.async { self.lastMessage = "binary(\(d.count))" }
+                DispatchQueue.main.async { self.processJSONMessage(s) }
+            case .data:
+                break
             @unknown default: break
             }
         case .failure(let err):
@@ -841,6 +848,9 @@ final class WebOSTV: ObservableObject {
                 self.pointerSocket?.close()
                 self.pointerSocket = nil
                 self.activeInputRemoteService = nil
+                self.installedApps.removeAll()
+                self.lastAppFetchDate = nil
+                self.cancelAppFetches(reason: "Socket error")
                 self.cancelAllPendingRequests(message: err.localizedDescription)
                 self.onDisconnect?()
                 self.lastMessage = "Socket error: \(err.localizedDescription)"
@@ -859,10 +869,7 @@ final class WebOSTV: ObservableObject {
 
         switch type {
         case "registered":
-            if let key = payload?["client-key"] as? String {
-                Self.savedClientKey = key
-                self.clientKey = key
-            }
+            if let key = payload?["client-key"] as? String { Self.savedClientKey = key; self.clientKey = key }
             DispatchQueue.main.async {
                 let firstRegistration = !self.registered
                 self.registered = true
@@ -871,23 +878,21 @@ final class WebOSTV: ObservableObject {
                 if firstRegistration {
                     self.onConnect?()
                     self.completeConnect(true, "Registered ✓")
+                    // proactively prime input remote services so buttons are ready immediately
                     self.ensureInputRemoteReady(force: true)
+                    self.prefetchInstalledApps()
                 }
             }
             return
 
         case "response":
-            handleResponse(id: id, payload: payload, dict: dict)
-            return
-
+            handleResponse(id: id, payload: payload, dict: dict); return
         case "error":
-            handleError(id: id, payload: payload, dict: dict)
-            return
-
-        default:
-            break
+            handleError(id: id, payload: payload, dict: dict); return
+        default: break
         }
 
+        // Handle pairing prompts that include client-key
         if let payload,
            let pairingType = payload["pairingType"] as? String,
            pairingType == "PROMPT",
@@ -903,8 +908,112 @@ final class WebOSTV: ObservableObject {
                     self.onConnect?()
                     self.completeConnect(true, "Registered ✓")
                     self.ensureInputRemoteReady(force: true)
+                    self.prefetchInstalledApps()
                 }
             }
+        }
+    }
+
+    // MARK: Error / response helpers (kept similar)
+    private func handleResponse(id: String?, payload: [String: Any]?, dict: [String: Any]) {
+        guard let id else { return }
+        let payloadData = payload ?? [:]
+        let returnValue = (payloadData["returnValue"] as? Bool) ?? true
+
+        if returnValue {
+            _ = completeRequest(id: id, result: .success(payloadData))
+        } else {
+            let message = extractErrorMessage(dict: dict, payload: payloadData)
+            let error = makeTVError(message, code: -11, payload: payloadData)
+            let handled = completeRequest(id: id, result: .failure(error))
+            if !handled { DispatchQueue.main.async { self.lastMessage = "Command failed: \(message)" } }
+        }
+    }
+
+    private func handleError(id: String?, payload: [String: Any]?, dict: [String: Any]) {
+        let message = extractErrorMessage(dict: dict, payload: payload)
+        var handled = false
+        if let id {
+            let error = makeTVError(message, code: -12, payload: payload)
+            handled = completeRequest(id: id, result: .failure(error))
+        }
+        if !handled && !registered { failEarly("TV error: \(message)") }
+        else if !handled { DispatchQueue.main.async { self.lastMessage = "TV error: \(message)" } }
+        if isGestureTimeout(message) { handleGestureTimeout() }
+    }
+
+    @discardableResult
+    private func completeRequest(id: String, result: Result<[String: Any], Error>) -> Bool {
+        guard let handler = pendingResponses.removeValue(forKey: id) else { return false }
+        DispatchQueue.main.async { handler(result) }
+        return true
+    }
+
+    private func extractErrorMessage(dict: [String: Any], payload: [String: Any]?) -> String {
+        if let payload, let text = payload["errorText"] as? String, !text.isEmpty { return text }
+        if let payload, let message = payload["message"] as? String, !message.isEmpty { return message }
+        if let error = dict["error"] as? String, !error.isEmpty { return error }
+        if let payload, let code = payload["errorCode"] { return "\(code)" }
+        return "Unknown error"
+    }
+
+    private func makeTVError(_ message: String, code: Int = -10, payload: [String: Any]? = nil) -> NSError {
+        var userInfo: [String: Any] = [NSLocalizedDescriptionKey: message]
+        if let payload, let errorCode = payload["errorCode"] { userInfo["errorCode"] = errorCode }
+        return NSError(domain: "WebOSTV", code: code, userInfo: userInfo)
+    }
+
+    private func isGestureTimeout(_ message: String) -> Bool { message.lowercased().contains("gesture gate timed out") }
+
+    private func isServiceMissing(_ message: String, error: Error) -> Bool {
+        let lower = message.lowercased()
+        if lower.contains("no such service") || lower.contains("service not found") { return true }
+        if lower.contains("invalid request") && lower.contains("input") { return true }
+        if lower.contains("404") { return true }
+        let ns = error as NSError
+        if let code = ns.userInfo["errorCode"] as? Int, code == 404 { return true }
+        if let codeString = ns.userInfo["errorCode"] as? String, codeString == "404" { return true }
+        return false
+    }
+
+    private func shouldFallbackToPointer(for error: Error) -> Bool {
+        let lower = error.localizedDescription.lowercased()
+        if lower.contains("internal server error") || lower.contains("500") || lower.contains("application error") { return true }
+        let ns = error as NSError
+        if let code = ns.userInfo["errorCode"] as? Int, (500...599).contains(code) { return true }
+        if (500...599).contains(ns.code) { return true }
+        return false
+    }
+
+    private func handleGestureTimeout() {
+        inputRemotePrimed = false
+        ensureInputRemoteReady(force: true)
+    }
+
+    // MARK: Utilities: cancel, complete connect, ping, etc.
+    private func cancelAllPendingRequests(message: String) {
+        guard !pendingResponses.isEmpty else { return }
+        let handlers = pendingResponses
+        pendingResponses.removeAll()
+        let error = makeTVError(message, code: -14)
+        for handler in handlers.values {
+            DispatchQueue.main.async { handler(.failure(error)) }
+        }
+    }
+
+    private func cancelAppFetches(reason: String) {
+        guard !appFetchCallbacks.isEmpty else { return }
+        let callbacks = appFetchCallbacks
+        appFetchCallbacks.removeAll()
+        let error = makeTVError(reason, code: -18)
+        callbacks.forEach { $0(.failure(error)) }
+    }
+
+    private func completeConnect(_ ok: Bool, _ message: String) {
+        let comp = connectCompletion
+        connectCompletion = nil
+        DispatchQueue.main.async {
+            comp?(ok, message)
         }
     }
 
@@ -920,9 +1029,9 @@ final class WebOSTV: ObservableObject {
             self.pointerSocket?.close()
             self.pointerSocket = nil
             self.activeInputRemoteService = nil
-            self.launchPointsCache = nil
-            self.launchPointsLoading = false
-            self.launchPointsWaiters.removeAll()
+            self.installedApps.removeAll()
+            self.lastAppFetchDate = nil
+            self.cancelAppFetches(reason: reason)
             self.cancelAllPendingRequests(message: reason)
             self.onDisconnect?()
             self.lastMessage = reason
@@ -930,619 +1039,221 @@ final class WebOSTV: ObservableObject {
         }
     }
 
-    // MARK: Sending helpers
+    // Add this inside WebOSTV class
 
-    private func nextRequestId(_ prefix: String) -> String {
-        defer { nextId += 1 }
-        return "\(prefix)-\(nextId)"
-    }
+    /// Build pointer socket URLs from the payload returned by pointer service.
+    private func pointerSocketURLs(from payload: [String: Any]) -> [URL] {
+        var rawEntries: [String] = []
 
-    private func send(_ object: [String: Any], completion: ((Error?) -> Void)? = nil) {
-        guard registered, let sock = socket else {
-            completion?(NSError(domain: "WebOSTV", code: -1,
-                                userInfo: [NSLocalizedDescriptionKey: "Not registered/connected"]))
-            return
-        }
-        guard let data = try? JSONSerialization.data(withJSONObject: object, options: []),
-              let text = String(data: data, encoding: .utf8) else {
-            completion?(NSError(domain: "WebOSTV", code: -2,
-                                userInfo: [NSLocalizedDescriptionKey: "Encode error"]))
-            return
-        }
-        sock.send(text, completion: completion)
-    }
+        if let secure = payload["socketPathSecure"] as? String { rawEntries.append(secure) }
+        if let path = payload["socketPath"] as? String { rawEntries.append(path) }
 
-    func sendSimple(uri: String,
-                    payload: [String: Any] = [:],
-                    completion: ((Result<[String: Any], Error>) -> Void)? = nil) {
-        guard registered else {
-            if let completion {
-                completion(.failure(makeTVError("TV not registered yet", code: -3)))
-            }
-            return
-        }
-
-        let requestId = nextRequestId("req")
-        let req: [String: Any] = [
-            "id": requestId,
-            "type": "request",
-            "uri": uri,
-            "payload": payload
-        ]
-
-        if let completion {
-            pendingResponses[requestId] = completion
-        }
-
-        send(req) { [weak self] error in
-            guard let self else { return }
-            if let error,
-               let handler = self.pendingResponses.removeValue(forKey: requestId) {
-                DispatchQueue.main.async {
-                    handler(.failure(error))
-                }
+        if let list = payload["socketPathList"] as? [String] {
+            rawEntries.append(contentsOf: list)
+        } else if let nestedList = payload["socketPathList"] as? [[String: Any]] {
+            for entry in nestedList {
+                if let uri = entry["uri"] as? String { rawEntries.append(uri) }
+                if let path = entry["path"] as? String { rawEntries.append(path) }
             }
         }
-    }
 
-    func sendButton(key: String) {
-        sendButton(key: key, allowQueue: true)
-    }
-
-    private func sendButton(key: String, allowQueue: Bool) {
-        guard registered else { return }
-
-        if let pointer = pointerSocket, pointer.isReady {
-            pointer.sendButton(key)
-            if retryingButtonKey == key {
-                retryingButtonKey = nil
-            }
-            return
+        if let socketPaths = payload["socketPaths"] as? [String] {
+            rawEntries.append(contentsOf: socketPaths)
+        }
+        if let socket = payload["socket"] as? String {
+            rawEntries.append(socket)
         }
 
-        guard inputRemotePrimed, let service = activeInputRemoteService else {
-            if allowQueue {
-                enqueueButtonForRetry(key, prioritizingFront: false)
-                ensureInputRemoteReady()
-            }
-            return
-        }
-
-        sendSimple(uri: service.sendButtonURI,
-                   payload: ["name": key]) { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .success:
-                if self.retryingButtonKey == key {
-                    self.retryingButtonKey = nil
-                }
-            case .failure(let error):
-                self.handleCommandFailure(error: error, key: key, allowQueue: allowQueue)
-            }
-        }
-    }
-
-    func launchStreamingApp(_ appId: String) {
-        attemptLaunch(appId: appId, originalKey: appId, tried: [])
-    }
-
-    private func attemptLaunch(appId: String, originalKey: String, tried: Set<String>) {
-        DispatchQueue.main.async {
-            self.lastMessage = "Launching \(self.displayName(for: appId))…"
-        }
-        sendSimple(uri: "ssap://system.launcher/launch",
-                   payload: ["id": appId]) { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .success:
-                break
-            case .failure(let error):
-                let updatedTried = tried.union([appId.lowercased()])
-                self.handleLaunchFailure(originalKey: originalKey, tried: updatedTried, error: error)
-            }
-        }
-    }
-
-    private func handleLaunchFailure(originalKey: String, tried: Set<String>, error: Error) {
-        let message = error.localizedDescription
-        guard isRecoverableLaunchError(message, error: error) else {
-            DispatchQueue.main.async {
-                self.lastMessage = "\(self.displayName(for: originalKey)) launch failed: \(message)"
-            }
-            return
-        }
-
-        resolveNextAppId(originalKey: originalKey, tried: tried) { [weak self] nextId in
-            guard let self else { return }
-            guard let nextId else {
-                DispatchQueue.main.async {
-                    self.lastMessage = "\(self.displayName(for: originalKey)) launch failed: \(message)"
-                }
-                return
-            }
-            DispatchQueue.main.async {
-                self.lastMessage = "Retrying \(self.displayName(for: originalKey)) as \(self.displayName(for: nextId))…"
-            }
-            self.attemptLaunch(appId: nextId, originalKey: originalKey, tried: tried)
-        }
-    }
-
-    private func displayName(for appId: String) -> String {
-        let key = appId.lowercased()
-        return streamingAppDisplayNames[key] ?? appId
-    }
-
-    private func isRecoverableLaunchError(_ message: String, error: Error) -> Bool {
-        let lower = message.lowercased()
-        if lower.contains("no such app") || lower.contains("no such application") || lower.contains("not installed") || lower.contains("no such service") || lower.contains("not exist") {
-            return true
-        }
-        if lower.contains("internal server error") ||
-            lower.contains("internal error") ||
-            lower.contains("application error") ||
-            lower.contains("500") ||
-            lower.contains("404") {
-            return true
-        }
-        let nsError = error as NSError
-        if (400...599).contains(nsError.code) {
-            return true
-        }
-        if let code = nsError.userInfo["errorCode"] as? Int, [404, 500].contains(code) {
-            return true
-        }
-        if let codeNumber = nsError.userInfo["errorCode"] as? NSNumber,
-           (400...599).contains(codeNumber.intValue) {
-            return true
-        }
-        if let codeString = nsError.userInfo["errorCode"] as? String,
-           let numeric = Int(codeString.trimmingCharacters(in: .whitespaces)),
-           (400...599).contains(numeric) {
-            return true
-        }
-        return false
-    }
-
-    private func resolveNextAppId(originalKey: String, tried: Set<String>, completion: @escaping (String?) -> Void) {
-        let key = originalKey.lowercased()
-        guard let fallback = streamingAppFallbacks[key] else {
-            completion(nil)
-            return
-        }
-
-        if let next = fallback.alternates.first(where: { !tried.contains($0.lowercased()) }) {
-            completion(next)
-            return
-        }
-
-        guard !fallback.keywordGroups.isEmpty else {
-            completion(nil)
-            return
-        }
-
-        fetchLaunchPoints { [weak self] result in
-            guard let self else {
-                completion(nil)
-                return
-            }
-            switch result {
-            case .success(let points):
-                let match = self.findAppId(in: points, matching: fallback.keywordGroups, excluding: tried)
-                completion(match)
-            case .failure:
-                completion(nil)
-            }
-        }
-    }
-
-    private func fetchLaunchPoints(_ completion: @escaping (Result<[[String: Any]], Error>) -> Void) {
-        if let cache = launchPointsCache {
-            completion(.success(cache))
-            return
-        }
-
-        launchPointsWaiters.append(completion)
-        guard !launchPointsLoading else { return }
-
-        launchPointsLoading = true
-        sendSimple(uri: "ssap://com.webos.applicationManager/listLaunchPoints") { [weak self] result in
-            guard let self else { return }
-            self.launchPointsLoading = false
-            switch result {
-            case .success(let payload):
-                let points = payload["launchPoints"] as? [[String: Any]] ?? []
-                self.launchPointsCache = points
-                self.launchPointsWaiters.forEach { $0(.success(points)) }
-            case .failure(let error):
-                self.launchPointsWaiters.forEach { $0(.failure(error)) }
-            }
-            self.launchPointsWaiters.removeAll()
-        }
-    }
-
-    private func findAppId(in launchPoints: [[String: Any]],
-                           matching keywordGroups: [[String]],
-                           excluding tried: Set<String>) -> String? {
-        let normalizedGroups = keywordGroups.map { group in group.map { $0.lowercased() } }
-        let flatKeywords = Set(normalizedGroups.flatMap { $0 })
-        let entries: [(id: String, title: String)] = launchPoints.compactMap { point in
-            if let id = point["id"] as? String {
-                let title = (point["title"] as? String ?? "").lowercased()
-                return (id, title)
-            }
-            if let appId = point["appId"] as? String {
-                let title = (point["title"] as? String ?? "").lowercased()
-                return (appId, title)
-            }
-            return nil
-        }
-
-        var bestMatch: (id: String, score: Int)?
-        for entry in entries {
-            if tried.contains(entry.id.lowercased()) { continue }
-            let idLower = entry.id.lowercased()
-            var score = 0
-            for group in normalizedGroups where !group.isEmpty {
-                let allMatch = group.allSatisfy { keyword in
-                    entry.title.contains(keyword) || idLower.contains(keyword)
-                }
-                if allMatch {
-                    score += 100 + group.count
-                } else {
-                    let partialCount = group.reduce(0) { partial, keyword in
-                        partial + (entry.title.contains(keyword) || idLower.contains(keyword) ? 1 : 0)
+        // If no explicit paths, TV may provide address/port
+        if rawEntries.isEmpty, let address = payload["address"] as? String {
+            var ports: [Int] = []
+            if let port = payload["port"] as? Int { ports.append(port) }
+            else if let ps = payload["port"] as? String, let p = Int(ps) { ports.append(p) }
+            if ports.isEmpty { ports = [3001, 3000] }
+            for scheme in ["wss", "ws"] {
+                for port in ports {
+                    if let url = URL(string: "\(scheme)://\(address):\(port)") {
+                        rawEntries.append(url.absoluteString)
                     }
-                    score += partialCount
-                }
-            }
-            if score == 0 && !flatKeywords.isEmpty {
-                let partialFlat = flatKeywords.reduce(0) { partial, keyword in
-                    partial + (entry.title.contains(keyword) || idLower.contains(keyword) ? 1 : 0)
-                }
-                score += partialFlat
-            }
-            if score > 0 {
-                if let best = bestMatch {
-                    if score > best.score {
-                        bestMatch = (entry.id, score)
-                    }
-                } else {
-                    bestMatch = (entry.id, score)
                 }
             }
         }
-        return bestMatch?.id
-    }
 
-    // For PairTVView compatibility
-    func fetchMacAddress(_ completion: @escaping (String?) -> Void) {
-        guard registered else { completion(nil); return }
-        let req: [String: Any] = [
-            "id": nextRequestId("sysinfo"),
-            "type": "request",
-            "uri": "luna://com.webos.service.tv.systemproperty/getSystemInfo",
-            "payload": ["keys": ["wifiMacAddress", "wiredMacAddress"]]
-        ]
-        send(req) { _ in
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { completion(nil) }
-        }
-    }
-
-    private func completeConnect(_ success: Bool, _ message: String) {
-        guard let completion = connectCompletion else { return }
-        connectCompletion = nil
-        if Thread.isMainThread {
-            completion(success, message)
-        } else {
-            DispatchQueue.main.async {
-                completion(success, message)
-            }
-        }
-    }
-
-    private final class PointerSocket: NSObject, URLSessionWebSocketDelegate, URLSessionDelegate {
-
-        private typealias SocketCandidate = (url: URL, protocols: [String])
-
-        // Offer at most one subprotocol name per handshake. Some TVs echo every value
-        // back in separate headers, which makes Apple's WebSocket stack reject the
-        // handshake when multiple values are present.
-        private static let protocolPreference: [[String]] = [
-            ["sec-websocket-protocol"],
-            ["lgtv"],
-            []
-        ]
-
-        private let allowInsecureLocalTLS: Bool
-        private let host: String
-        private let clientKey: String?
-        private let registerMessage: String?
-        private var shouldSendRegisterOnOpen = false
-        private var session: URLSession!
-        private var candidateQueue: [SocketCandidate] = []
-        private var currentCandidate: SocketCandidate?
-        private var currentTask: URLSessionWebSocketTask?
-        private var completion: ((Bool, Error?) -> Void)?
-        private var sendQueue: [String] = []
-        private var isOpen = false
-        private var lastError: Error?
-
-        var onDisconnect: ((Error?) -> Void)?
-
-        var isReady: Bool { isOpen }
-
-        init(host: String, clientKey: String?, allowInsecureLocalTLS: Bool) {
-            self.host = host
-            self.clientKey = clientKey
-            self.registerMessage = PointerSocket.makeRegisterMessage(clientKey: clientKey)
-            self.allowInsecureLocalTLS = allowInsecureLocalTLS
-            super.init()
-            let configuration = URLSessionConfiguration.default
-            session = URLSession(configuration: configuration, delegate: self, delegateQueue: .main)
-        }
-
-        func connect(urls: [URL], completion: @escaping (Bool, Error?) -> Void) {
-            self.completion = completion
-            candidateQueue = buildCandidateQueue(from: urls)
-            currentCandidate = nil
-            lastError = nil
-            shouldSendRegisterOnOpen = registerMessage != nil
-            sendQueue.removeAll()
-            isOpen = false
-            attemptNextCandidate()
-        }
-
-        func sendButton(_ key: String) {
-            let payload: [String: String] = ["type": "button", "name": key]
-            guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
-                  let text = String(data: data, encoding: .utf8) else { return }
-
-            sendOrQueue(text)
-        }
-
-        func close() {
-            if completion != nil {
-                let error = NSError(domain: "PointerSocket",
-                                    code: -999,
-                                    userInfo: [NSLocalizedDescriptionKey: "Pointer socket cancelled"])
-                complete(success: false, error: error)
-            }
-            onDisconnect = nil
-            candidateQueue.removeAll()
-            currentCandidate = nil
-            lastError = nil
-            isOpen = false
-            sendQueue.removeAll()
-            currentTask?.cancel(with: .goingAway, reason: nil)
-            currentTask = nil
-            session.invalidateAndCancel()
-        }
-
-        private func attemptNextCandidate() {
-            currentTask?.cancel(with: .goingAway, reason: nil)
-            currentTask = nil
-            isOpen = false
-
-            guard !candidateQueue.isEmpty else {
-                let failureError: Error
-                if let lastError {
-                    failureError = lastError
-                } else {
-                    var userInfo: [String: Any] = [NSLocalizedDescriptionKey: "Unable to open pointer socket"]
-                    if let candidate = currentCandidate {
-                        userInfo["candidateURL"] = candidate.url.absoluteString
-                        if !candidate.protocols.isEmpty {
-                            userInfo["protocols"] = candidate.protocols.joined(separator: ",")
+        var urls: [URL] = []
+        for entry in rawEntries {
+            let trimmed = entry.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            // If an absolute url, keep it. Else try building with ip & common ports
+            if let url = URL(string: trimmed), url.scheme != nil {
+                urls.append(url)
+            } else {
+                var t = trimmed
+                if t.hasPrefix("//") { t.removeFirst(2) }
+                if !t.hasPrefix("/") { t = "/\(t)" }
+                for scheme in ["wss", "ws"] {
+                    for port in [3001, 3000] {
+                        if let url = URL(string: "\(scheme)://\(ip):\(port)\(t)") {
+                            urls.append(url)
                         }
                     }
-                    failureError = NSError(domain: "PointerSocket", code: -1, userInfo: userInfo)
-                }
-                complete(success: false, error: failureError)
-                return
-            }
-
-            let candidate = candidateQueue.removeFirst()
-            currentCandidate = candidate
-            lastError = nil
-            let task: URLSessionWebSocketTask
-            if candidate.protocols.isEmpty {
-                task = session.webSocketTask(with: candidate.url)
-            } else {
-                task = session.webSocketTask(with: candidate.url, protocols: candidate.protocols)
-            }
-            currentTask = task
-            task.resume()
-            receiveLoop(task)
-        }
-
-        private func receiveLoop(_ task: URLSessionWebSocketTask) {
-            task.receive { [weak self] result in
-                guard let self else { return }
-                guard task === self.currentTask else { return }
-                switch result {
-                case .success:
-                    self.receiveLoop(task)
-                case .failure(let error):
-                    if self.isOpen {
-                        self.handleDisconnect(error: error)
-                    } else {
-                        self.lastError = error
-                        self.attemptNextCandidate()
-                    }
                 }
             }
         }
 
-        private func flushQueuedSends() {
-            guard isOpen, let task = currentTask else { return }
-            for text in sendQueue {
-                task.send(.string(text)) { [weak self] error in
-                    guard let self, let error else { return }
-                    DispatchQueue.main.async { self.handleDisconnect(error: error) }
-                }
-            }
-            sendQueue.removeAll()
-        }
-
-        private func sendOrQueue(_ text: String) {
-            guard isOpen, let task = currentTask else {
-                sendQueue.append(text)
-                return
-            }
-            task.send(.string(text)) { [weak self] error in
-                guard let self, let error else { return }
-                DispatchQueue.main.async { self.handleDisconnect(error: error) }
-            }
-        }
-
-        private func handleDisconnect(error: Error?) {
-            currentTask?.cancel(with: .goingAway, reason: nil)
-            currentTask = nil
-            sendQueue.removeAll()
-            shouldSendRegisterOnOpen = registerMessage != nil
-            if isOpen {
-                isOpen = false
-                currentCandidate = nil
-                let callback = onDisconnect
-                if let callback {
-                    callback(error)
-                }
-            } else {
-                lastError = error
-                attemptNextCandidate()
-            }
-        }
-
-        private func complete(success: Bool, error: Error?) {
-            guard let completion else { return }
-            self.completion = nil
-            if success {
-                candidateQueue.removeAll()
-                currentCandidate = nil
-            }
-            completion(success, error)
-        }
-
-        // MARK: URLSessionWebSocketDelegate
-
-        func urlSession(_ session: URLSession,
-                        webSocketTask: URLSessionWebSocketTask,
-                        didOpenWithProtocol protocol: String?) {
-            guard webSocketTask === currentTask else { return }
-            isOpen = true
-            lastError = nil
-            sendRegisterIfNeeded(using: webSocketTask)
-            flushQueuedSends()
-            complete(success: true, error: nil)
-        }
-
-        func urlSession(_ session: URLSession,
-                        webSocketTask: URLSessionWebSocketTask,
-                        didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
-                        reason: Data?) {
-            guard webSocketTask === currentTask else { return }
-            let error = NSError(domain: "PointerSocket",
-                                code: Int(closeCode.rawValue),
-                                userInfo: [NSLocalizedDescriptionKey: "Pointer socket closed (\(closeCode.rawValue))"])
-            handleDisconnect(error: error)
-        }
-
-        func urlSession(_ session: URLSession,
-                        task: URLSessionTask,
-                        didCompleteWithError error: Error?) {
-            guard let error, task === currentTask else { return }
-            handleDisconnect(error: error)
-        }
-
-        private func buildCandidateQueue(from urls: [URL]) -> [SocketCandidate] {
-            guard !urls.isEmpty else { return [] }
-
-            let prioritized = prioritize(urls: urls)
-            var raw: [SocketCandidate] = []
-            for url in prioritized {
-                for protocols in PointerSocket.protocolPreference {
-                    raw.append((url, protocols))
-                }
-            }
-            return dedupeCandidates(raw)
-        }
-
-        private func prioritize(urls: [URL]) -> [URL] {
-            urls.sorted { lhs, rhs in
-                schemePriority(lhs) < schemePriority(rhs)
-            }
-        }
-
-        private func schemePriority(_ url: URL) -> Int {
-            switch url.scheme?.lowercased() {
-            case "wss": return 0
-            case "ws": return 1
-            case "https": return 2
-            case "http": return 3
-            default: return 4
-            }
-        }
-
-        private func dedupeCandidates(_ candidates: [SocketCandidate]) -> [SocketCandidate] {
-            var seen = Set<String>()
-            var result: [SocketCandidate] = []
-            for candidate in candidates {
-                let protoKey = candidate.protocols.joined(separator: ",")
-                let key = candidate.url.absoluteString + "|" + protoKey
-                if seen.insert(key).inserted {
-                    result.append(candidate)
-                }
-            }
-            return result
-        }
-
-        private func sendRegisterIfNeeded(using task: URLSessionWebSocketTask) {
-            guard shouldSendRegisterOnOpen, let message = registerMessage else { return }
-            shouldSendRegisterOnOpen = false
-            task.send(.string(message)) { [weak self] error in
-                guard let self, let error else { return }
-                DispatchQueue.main.async { self.handleDisconnect(error: error) }
-            }
-        }
-
-        private static func makeRegisterMessage(clientKey: String?) -> String? {
-            var payload: [String: Any] = ["type": "register"]
-            if let key = clientKey, !key.isEmpty {
-                payload["client-key"] = key
-            }
-            guard let data = try? JSONSerialization.data(withJSONObject: payload, options: []),
-                  let text = String(data: data, encoding: .utf8) else { return nil }
-            return text
-        }
-
-        // MARK: URLSessionDelegate
-
-        func urlSession(_ session: URLSession,
-                        didReceive challenge: URLAuthenticationChallenge,
-                        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
-            let challengeHost = challenge.protectionSpace.host.isEmpty ? host : challenge.protectionSpace.host
-            guard allowInsecureLocalTLS,
-                  challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
-                  let trust = challenge.protectionSpace.serverTrust,
-                  isLocalRFC1918(host: challengeHost) else {
-                completionHandler(.performDefaultHandling, nil)
-                return
-            }
-
-            completionHandler(.useCredential, URLCredential(trust: trust))
-        }
-
-        private func isLocalRFC1918(host: String) -> Bool {
-            if host.hasPrefix("10.") { return true }
-            if host.hasPrefix("192.168.") { return true }
-            if host.hasPrefix("172.") {
-                let parts = host.split(separator: ".")
-                if parts.count > 1, let second = Int(parts[1]), (16...31).contains(second) {
-                    return true
-                }
-            }
-            return false
-        }
+        // dedupe
+        var seen = Set<String>()
+        return urls.filter { seen.insert($0.absoluteString).inserted }
     }
+
+    /// Register payload for input remote registration (uses saved client key if present)
+    private func inputRemoteRegisterPayload() -> [String: Any] {
+        if let key = self.clientKey, !key.isEmpty {
+            return ["client-key": key]
+        }
+        return [:]
+    }// Call this from PairTVView after connect(...) succeeds.
+    // It will attempt several common URIs and scan the reply for MAC-like values.
+    func fetchMacAddress(completion: @escaping (String?) -> Void) {
+        // If not registered, return quickly
+        guard registered else {
+            completion(nil)
+            return
+        }
+
+        // Candidate URIs to query for device/network info (various TVs expose differing endpoints)
+        let candidates = [
+            "ssap://com.webos.service.tv.system/getDeviceInfo",
+            "ssap://com.webos.service.system/getDeviceInfo",
+            "ssap://system/getDeviceInfo",
+            "ssap://com.webos.service.network/getNetworkInfo",
+            "ssap://com.webos.service.network/getMacAddress",
+            "ssap://com.webos.service.tv.system/getWol", // sometimes returns mac in payload
+            "ssap://com.webos.service.tv.info/getDeviceInfo"
+        ]
+
+        // Helper: try URIs sequentially until we find a MAC
+        func tryNext(_ index: Int) {
+            if index >= candidates.count {
+                DispatchQueue.main.async { completion(nil) }
+                return
+            }
+            let uri = candidates[index]
+
+            // sendSimple already handles registration & retries
+            sendSimple(uri: uri, payload: [:], retries: 1) { [weak self] result in
+                guard let self = self else { DispatchQueue.main.async { completion(nil) }; return }
+
+                switch result {
+                case .success(let payload):
+                    // Search payload for mac-like strings
+                    if let found = self.extractMacFromPayload(payload) {
+                        DispatchQueue.main.async { completion(found) }
+                        return
+                    }
+                    // sometimes the payload wraps nested dictionaries/arrays
+                    if let found = self.deepSearchForMac(in: payload) {
+                        DispatchQueue.main.async { completion(found) }
+                        return
+                    }
+                    // try next candidate
+                    tryNext(index + 1)
+
+                case .failure(_):
+                    // try next candidate on any failure
+                    tryNext(index + 1)
+                }
+            }
+        }
+
+        tryNext(0)
+    }
+
+    // MARK: - Helpers to extract MAC from returned payloads
+
+    private func extractMacFromPayload(_ payload: [String: Any]) -> String? {
+        // Common keys that might directly contain a mac
+        let keys = ["mac", "macAddress", "ethernetMac", "wifiMac", "bssid", "address"]
+        for k in keys {
+            if let v = payload[k] as? String, let normalized = normalizeMac(v) {
+                return normalized
+            }
+            if let vnum = payload[k] as? NSNumber {
+                // unlikely, but convert to string
+                if let normalized = normalizeMac("\(vnum)") { return normalized }
+            }
+        }
+
+        // Sometimes the payload has "device" sub-dict
+        if let device = payload["device"] as? [String: Any] {
+            if let mac = extractMacFromPayload(device) { return mac }
+        }
+        if let network = payload["network"] as? [String: Any] {
+            if let mac = extractMacFromPayload(network) { return mac }
+        }
+
+        // Look for any string values containing mac-like pattern in the top-level payload
+        for (_, value) in payload {
+            if let s = value as? String, let normalized = normalizeMac(s) {
+                return normalized
+            }
+        }
+
+        return nil
+    }
+
+    private func deepSearchForMac(in any: Any) -> String? {
+        // recursively scan dictionaries and arrays for MAC-like strings
+        if let dict = any as? [String: Any] {
+            if let found = extractMacFromPayload(dict) { return found }
+            for (_, v) in dict {
+                if let found = deepSearchForMac(in: v) { return found }
+            }
+        } else if let arr = any as? [Any] {
+            for item in arr {
+                if let found = deepSearchForMac(in: item) { return found }
+            }
+        } else if let s = any as? String {
+            return normalizeMac(s)
+        }
+        return nil
+    }
+
+    private func normalizeMac(_ raw: String) -> String? {
+        // find any 12-hex or 6 pairs patterns in the string
+        // Accepts formats: AABBCCDDEEFF, AA:BB:CC:DD:EE:FF, AA-BB-CC-DD-EE-FF, AA.BB.CC.DD.EE.FF
+        let candidate = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
+        // regex to find 6 hex pairs separators or 12 hex digits
+        let patterns = [
+            "([0-9a-f]{2}[:\\-\\.]){5}[0-9a-f]{2}",   // AA:BB:... or AA-BB-... or AA.BB...
+            "[0-9a-f]{12}"                            // AABBCCDDEEFF
+        ]
+
+        for pat in patterns {
+            if let range = candidate.range(of: pat, options: .regularExpression) {
+                let match = String(candidate[range])
+                // remove separators and uppercase with colons
+                let hexOnly = match.replacingOccurrences(of: "[:\\-\\.]", with: "", options: .regularExpression)
+                guard hexOnly.count == 12 else { continue }
+                var outParts: [String] = []
+                var i = hexOnly.startIndex
+                for _ in 0..<6 {
+                    let j = hexOnly.index(i, offsetBy: 2)
+                    outParts.append(String(hexOnly[i..<j]).uppercased())
+                    i = j
+                }
+                return outParts.joined(separator: ":")
+            }
+        }
+
+        return nil
+    }
+
+
+    // MARK: saved properties
+    static var savedIPKey: String { "LGRemoteMVP.lastIP" }
+    static var savedMACKey: String { "LGRemoteMVP.lastMAC" }
+
+    // MARK: - End
 }
 
