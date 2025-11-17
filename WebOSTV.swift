@@ -125,6 +125,15 @@ final class WebOSTV: ObservableObject {
         "com.jio.media.jioplay.tv": "JioCinema"
     ]
 
+    private struct TVApp: Equatable {
+        let id: String
+        let title: String
+    }
+
+    private var installedApps: [TVApp] = []
+    private var lastAppFetchDate: Date?
+    private var appFetchCallbacks: [(Result<[TVApp], Error>) -> Void] = []
+
     // Persisted convenience
     static var savedIP: String?  { UserDefaults.standard.string(forKey: "LGRemoteMVP.lastIP") }
     static var savedMAC: String? { UserDefaults.standard.string(forKey: "LGRemoteMVP.lastMAC") }
@@ -145,6 +154,9 @@ final class WebOSTV: ObservableObject {
         queuedButtons.removeAll()
         retryingButtonKey = nil
         failedButtonServices.removeAll()
+        installedApps.removeAll()
+        lastAppFetchDate = nil
+        cancelAppFetches(reason: "Connecting to new TV")
         pointerSocket?.close()
         pointerSocket = nil
         activeInputRemoteService = nil
@@ -567,27 +579,146 @@ final class WebOSTV: ObservableObject {
 
     // Helper: find alternate IDs to retry
     private func resolveNextAppId(originalKey: String, tried: Set<String>, completion: @escaping (String?) -> Void) {
-        let lower = originalKey.lowercased()
-        if let fallback = streamingAppFallbacks[lower] {
-            for alt in fallback.alternates {
-                if !tried.contains(alt.lowercased()) {
-                    completion(alt)
-                    return
+        if let staticId = nextStaticAppId(originalKey: originalKey, tried: tried) {
+            completion(staticId)
+            return
+        }
+
+        let keywords = keywordGroups(for: originalKey)
+
+        if let cached = searchInstalledApps(using: keywords, tried: tried) {
+            completion(cached)
+            return
+        }
+
+        fetchInstalledApps(force: false) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success:
+                completion(self.searchInstalledApps(using: keywords, tried: tried))
+            case .failure(let error):
+                DispatchQueue.main.async {
+                    self.lastMessage = "Couldn’t fetch installed apps: \(error.localizedDescription)"
                 }
+                completion(nil)
             }
         }
-        // try by keyword groups: scan fallback list
+    }
+
+    private func nextStaticAppId(originalKey: String, tried: Set<String>) -> String? {
+        let lower = originalKey.lowercased()
+        if let fallback = streamingAppFallbacks[lower] {
+            for alt in fallback.alternates where !tried.contains(alt.lowercased()) {
+                return alt
+            }
+        }
         for (key, fallback) in streamingAppFallbacks {
             if tried.contains(key) { continue }
             for group in fallback.keywordGroups {
-                let matches = group.allSatisfy { lower.contains($0) }
-                if matches && !tried.contains(key) {
-                    completion(key)
-                    return
+                if group.allSatisfy({ lower.contains($0) }) {
+                    return key
                 }
             }
         }
-        completion(nil)
+        return nil
+    }
+
+    private func keywordGroups(for key: String) -> [[String]] {
+        var groups: [[String]] = []
+        if let fallback = streamingAppFallbacks[key.lowercased()] {
+            groups.append(contentsOf: fallback.keywordGroups)
+        }
+        if let display = streamingAppDisplayNames[key.lowercased()] {
+            let tokens = normalizedKeywords(from: display)
+            if !tokens.isEmpty { groups.append(tokens) }
+        }
+        let direct = normalizedKeywords(from: key)
+        if !direct.isEmpty { groups.append(direct) }
+        return groups
+    }
+
+    private func normalizedKeywords(from text: String) -> [String] {
+        return text
+            .lowercased()
+            .split { !$0.isLetter && !$0.isNumber }
+            .map { String($0) }
+            .filter { !$0.isEmpty }
+    }
+
+    private func searchInstalledApps(using keywordGroups: [[String]], tried: Set<String>) -> String? {
+        guard !installedApps.isEmpty else { return nil }
+        for group in keywordGroups where !group.isEmpty {
+            if let match = installedApps.first(where: { app in
+                guard !tried.contains(app.id.lowercased()) else { return false }
+                let haystack = "\(app.title) \(app.id)".lowercased()
+                return group.allSatisfy { haystack.contains($0) }
+            }) {
+                return match.id
+            }
+        }
+        return nil
+    }
+
+    private func fetchInstalledApps(force: Bool,
+                                    completion: @escaping (Result<[TVApp], Error>) -> Void) {
+        DispatchQueue.main.async {
+            if !force,
+               let last = self.lastAppFetchDate,
+               Date().timeIntervalSince(last) < 30,
+               !self.installedApps.isEmpty {
+                completion(.success(self.installedApps))
+                return
+            }
+
+            guard self.registered else {
+                completion(.failure(self.makeTVError("TV not registered", code: -16)))
+                return
+            }
+
+            self.appFetchCallbacks.append(completion)
+            if self.appFetchCallbacks.count > 1 { return }
+
+            self.sendSimple(uri: "ssap://com.webos.applicationManager/listApps",
+                            payload: [:],
+                            retries: 1) { [weak self] result in
+                guard let self else { return }
+                switch result {
+                case .success(let payload):
+                    let apps = self.parseInstalledApps(from: payload)
+                    self.installedApps = apps
+                    self.lastAppFetchDate = Date()
+                    let callbacks = self.appFetchCallbacks
+                    self.appFetchCallbacks.removeAll()
+                    callbacks.forEach { $0(.success(apps)) }
+                case .failure(let error):
+                    let callbacks = self.appFetchCallbacks
+                    self.appFetchCallbacks.removeAll()
+                    callbacks.forEach { $0(.failure(error)) }
+                }
+            }
+        }
+    }
+
+    private func parseInstalledApps(from payload: [String: Any]) -> [TVApp] {
+        guard let entries = payload["apps"] as? [[String: Any]] else { return [] }
+        var seen = Set<String>()
+        var parsed: [TVApp] = []
+        for entry in entries {
+            guard let idRaw = entry["id"] as? String else { continue }
+            let id = idRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !id.isEmpty else { continue }
+            if !seen.insert(id.lowercased()).inserted { continue }
+            let title = (entry["title"] as? String ??
+                         entry["name"] as? String ??
+                         entry["appName"] as? String ??
+                         id).trimmingCharacters(in: .whitespacesAndNewlines)
+            parsed.append(TVApp(id: id, title: title))
+        }
+        return parsed
+    }
+
+    private func prefetchInstalledApps() {
+        fetchInstalledApps(force: true) { _ in }
     }
 
     // MARK: Socket open / register / pairing (unchanged core logic)
@@ -629,6 +760,9 @@ final class WebOSTV: ObservableObject {
         pointerSocket?.close()
         pointerSocket = nil
         activeInputRemoteService = nil
+        installedApps.removeAll()
+        lastAppFetchDate = nil
+        cancelAppFetches(reason: "Disconnected")
         cancelAllPendingRequests(message: "Disconnected")
         if connectCompletion != nil { completeConnect(false, "Disconnected") }
         DispatchQueue.main.async { self.isConnected = false; self.onDisconnect?() }
@@ -701,6 +835,9 @@ final class WebOSTV: ObservableObject {
                 self.pointerSocket?.close()
                 self.pointerSocket = nil
                 self.activeInputRemoteService = nil
+                self.installedApps.removeAll()
+                self.lastAppFetchDate = nil
+                self.cancelAppFetches(reason: "Socket error")
                 self.cancelAllPendingRequests(message: err.localizedDescription)
                 self.onDisconnect?()
                 self.lastMessage = "Socket error: \(err.localizedDescription)"
@@ -730,6 +867,7 @@ final class WebOSTV: ObservableObject {
                     self.completeConnect(true, "Registered ✓")
                     // proactively prime input remote services so buttons are ready immediately
                     self.ensureInputRemoteReady(force: true)
+                    self.prefetchInstalledApps()
                 }
             }
             return
@@ -757,6 +895,7 @@ final class WebOSTV: ObservableObject {
                     self.onConnect?()
                     self.completeConnect(true, "Registered ✓")
                     self.ensureInputRemoteReady(force: true)
+                    self.prefetchInstalledApps()
                 }
             }
         }
@@ -849,6 +988,14 @@ final class WebOSTV: ObservableObject {
         }
     }
 
+    private func cancelAppFetches(reason: String) {
+        guard !appFetchCallbacks.isEmpty else { return }
+        let callbacks = appFetchCallbacks
+        appFetchCallbacks.removeAll()
+        let error = makeTVError(reason, code: -18)
+        callbacks.forEach { $0(.failure(error)) }
+    }
+
     private func completeConnect(_ ok: Bool, _ message: String) {
         let comp = connectCompletion
         connectCompletion = nil
@@ -869,6 +1016,9 @@ final class WebOSTV: ObservableObject {
             self.pointerSocket?.close()
             self.pointerSocket = nil
             self.activeInputRemoteService = nil
+            self.installedApps.removeAll()
+            self.lastAppFetchDate = nil
+            self.cancelAppFetches(reason: reason)
             self.cancelAllPendingRequests(message: reason)
             self.onDisconnect?()
             self.lastMessage = reason
