@@ -59,6 +59,7 @@ final class WebOSTV: ObservableObject {
     private var activeInputRemoteService: InputRemoteService?
     private var pointerSocket: PointerSocket?
     private var clientKey: String? = WebOSTV.savedClientKey
+    private var failedButtonServices: Set<String> = []
     private struct StreamingAppFallback {
         let alternates: [String]
         let keywordGroups: [[String]]
@@ -72,6 +73,10 @@ final class WebOSTV: ObservableObject {
                 "com.amazon.shoptv.webos", "primevideo-webos", "amazonprimevideo-webos"
             ],
             keywordGroups: [["prime", "video"], ["amazon", "prime"], ["prime"]]
+        )
+        let netflix = StreamingAppFallback(
+            alternates: [],
+            keywordGroups: [["netflix"]]
         )
         let hotstar = StreamingAppFallback(
             alternates: ["disneyplus-hotstar", "hotstar", "com.disney.disneyplus-in", "com.star.hotstar", "disney.hotstar"],
@@ -91,6 +96,7 @@ final class WebOSTV: ObservableObject {
 
         var map: [String: StreamingAppFallback] = [
             "amzn.tvarm": prime,
+            "netflix": netflix,
             "com.startv.hotstar.lg": hotstar,
             "com.sonyliv.lg": sonyLiv,
             "com.jio.media.jioplay.tv": jioCinema
@@ -124,6 +130,7 @@ final class WebOSTV: ObservableObject {
         "com.amazon.shoptv.webos": "Prime Video",
         "primevideo-webos": "Prime Video",
         "amazonprimevideo-webos": "Prime Video",
+        "netflix": "Netflix",
         "com.startv.hotstar.lg": "Disney+ Hotstar",
         "disneyplus-hotstar": "Disney+ Hotstar",
         "hotstar": "Disney+ Hotstar",
@@ -168,6 +175,7 @@ final class WebOSTV: ObservableObject {
         inputRemotePriming = false
         queuedButtons.removeAll()
         retryingButtonKey = nil
+        failedButtonServices.removeAll()
         pointerSocket?.close()
         pointerSocket = nil
         activeInputRemoteService = nil
@@ -339,28 +347,35 @@ final class WebOSTV: ObservableObject {
             return
         }
 
-        guard index < inputRemoteButtonCandidates.count else {
-            primePointerService(at: 0, collectedError: collectedError)
+        var searchIndex = index
+        while searchIndex < inputRemoteButtonCandidates.count {
+            let service = inputRemoteButtonCandidates[searchIndex]
+            if failedButtonServices.contains(service.registerURI) {
+                searchIndex += 1
+                continue
+            }
+            let payload = inputRemoteRegisterPayload()
+            let currentIndex = searchIndex
+            sendSimple(uri: service.registerURI, payload: payload) { [weak self] result in
+                guard let self else { return }
+                switch result {
+                case .success:
+                    self.pointerSocket?.close()
+                    self.pointerSocket = nil
+                    self.activeInputRemoteService = service
+                    self.inputRemotePrimed = true
+                    self.inputRemotePriming = false
+                    self.lastMessage = "Input remote ready (buttons)"
+                    self.flushQueuedButtons()
+                case .failure(let error):
+                    self.failedButtonServices.insert(service.registerURI)
+                    self.primeButtonService(at: currentIndex + 1, collectedError: error)
+                }
+            }
             return
         }
 
-        let service = inputRemoteButtonCandidates[index]
-        let payload = inputRemoteRegisterPayload()
-        sendSimple(uri: service.registerURI, payload: payload) { [weak self] result in
-            guard let self else { return }
-            switch result {
-            case .success:
-                self.pointerSocket?.close()
-                self.pointerSocket = nil
-                self.activeInputRemoteService = service
-                self.inputRemotePrimed = true
-                self.inputRemotePriming = false
-                self.lastMessage = "Input remote ready (buttons)"
-                self.flushQueuedButtons()
-            case .failure(let error):
-                self.primeButtonService(at: index + 1, collectedError: error)
-            }
-        }
+        primePointerService(at: 0, collectedError: collectedError)
     }
 
     private func primePointerService(at index: Int, collectedError: Error?) {
@@ -426,6 +441,22 @@ final class WebOSTV: ObservableObject {
         retryingButtonKey = nil
         for key in pending {
             sendButton(key: key, allowQueue: false)
+        }
+    }
+
+    private func enqueueButtonForRetry(_ key: String, prioritizingFront: Bool) {
+        queuedButtons.removeAll { $0 == key }
+        if prioritizingFront {
+            queuedButtons.insert(key, at: 0)
+        } else {
+            queuedButtons.append(key)
+        }
+        if queuedButtons.count > 30 {
+            if prioritizingFront {
+                queuedButtons = Array(queuedButtons.prefix(30))
+            } else {
+                queuedButtons.removeFirst(queuedButtons.count - 30)
+            }
         }
     }
 
@@ -605,11 +636,7 @@ final class WebOSTV: ObservableObject {
                 retryingButtonKey = key
             }
             if allowQueue {
-                queuedButtons.removeAll { $0 == key }
-                queuedButtons.insert(key, at: 0)
-                if queuedButtons.count > 30 {
-                    queuedButtons = Array(queuedButtons.prefix(30))
-                }
+                enqueueButtonForRetry(key, prioritizingFront: true)
             }
             activeInputRemoteService = nil
             pointerSocket?.close()
@@ -622,10 +649,15 @@ final class WebOSTV: ObservableObject {
         if allowQueue && isGestureTimeout(message) {
             if retryingButtonKey != key {
                 retryingButtonKey = key
-                queuedButtons.insert(key, at: 0)
+                enqueueButtonForRetry(key, prioritizingFront: true)
             }
             inputRemotePrimed = false
             ensureInputRemoteReady(force: true)
+            return
+        }
+
+        if allowQueue && shouldFallbackToPointer(for: message, error: error) {
+            handleFatalButtonServiceError(message: message, key: key, allowQueue: allowQueue)
             return
         }
 
@@ -636,6 +668,47 @@ final class WebOSTV: ObservableObject {
         DispatchQueue.main.async {
             self.lastMessage = "Command failed: \(message)"
         }
+    }
+
+    private func shouldFallbackToPointer(for message: String, error: Error) -> Bool {
+        let lower = message.lowercased()
+        if lower.contains("application error") { return true }
+        if lower.contains("internal server error") { return true }
+        if lower.contains("500") { return true }
+
+        let nsError = error as NSError
+        if isServerError(code: nsError.code) { return true }
+        if let code = nsError.userInfo["errorCode"] as? Int, isServerError(code: code) { return true }
+        if let codeNumber = nsError.userInfo["errorCode"] as? NSNumber,
+           isServerError(code: codeNumber.intValue) { return true }
+        if let codeString = nsError.userInfo["errorCode"] as? String,
+           let numeric = Int(codeString.trimmingCharacters(in: .whitespaces)),
+           isServerError(code: numeric) { return true }
+        return false
+    }
+
+    private func handleFatalButtonServiceError(message: String, key: String, allowQueue: Bool) {
+        if retryingButtonKey != key {
+            retryingButtonKey = key
+        }
+        if allowQueue {
+            enqueueButtonForRetry(key, prioritizingFront: true)
+        }
+        if let service = activeInputRemoteService {
+            failedButtonServices.insert(service.registerURI)
+        }
+        activeInputRemoteService = nil
+        inputRemotePrimed = false
+        pointerSocket?.close()
+        pointerSocket = nil
+        DispatchQueue.main.async {
+            self.lastMessage = "Button input rejected (\(message)). Switching input method…"
+        }
+        ensureInputRemoteReady(force: true)
+    }
+
+    private func isServerError(code: Int) -> Bool {
+        (500...599).contains(code)
     }
 
     private func cancelAllPendingRequests(message: String) {
@@ -683,6 +756,7 @@ final class WebOSTV: ObservableObject {
         inputRemotePriming = false
         queuedButtons.removeAll()
         retryingButtonKey = nil
+        failedButtonServices.removeAll()
         pointerSocket?.close()
         pointerSocket = nil
         activeInputRemoteService = nil
@@ -764,6 +838,7 @@ final class WebOSTV: ObservableObject {
                 self.inputRemotePriming = false
                 self.queuedButtons.removeAll()
                 self.retryingButtonKey = nil
+                self.failedButtonServices.removeAll()
                 self.pointerSocket?.close()
                 self.pointerSocket = nil
                 self.activeInputRemoteService = nil
@@ -842,6 +917,7 @@ final class WebOSTV: ObservableObject {
             self.inputRemotePriming = false
             self.queuedButtons.removeAll()
             self.retryingButtonKey = nil
+            self.failedButtonServices.removeAll()
             self.pointerSocket?.close()
             self.pointerSocket = nil
             self.activeInputRemoteService = nil
@@ -927,10 +1003,7 @@ final class WebOSTV: ObservableObject {
 
         guard inputRemotePrimed, let service = activeInputRemoteService else {
             if allowQueue {
-                queuedButtons.append(key)
-                if queuedButtons.count > 30 {
-                    queuedButtons.removeFirst(queuedButtons.count - 30)
-                }
+                enqueueButtonForRetry(key, prioritizingFront: false)
                 ensureInputRemoteReady()
             }
             return
